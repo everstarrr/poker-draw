@@ -1,0 +1,1234 @@
+    -- ============================================
+-- 0. РЕГИСТРАЦИЯ ИГРОКА
+-- ============================================
+CREATE OR REPLACE FUNCTION register_user(
+    p_email VARCHAR(255),
+    p_username VARCHAR(30),
+    p_password VARCHAR(255)
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Проверяем, существует ли email
+    IF EXISTS (SELECT 1 FROM Users WHERE email = p_email) THEN
+        RETURN json_build_object('success', false, 'error', 'Email already registered');
+    END IF;
+    
+    -- Проверяем, существует ли username
+    IF EXISTS (SELECT 1 FROM Users WHERE username = p_username) THEN
+        RETURN json_build_object('success', false, 'error', 'Username already taken');
+    END IF;
+    
+    -- Создаем пользователя
+    INSERT INTO Users (email, username, password, last_activity)
+    VALUES (p_email, p_username, p_password, NOW());
+    
+    RETURN json_build_object(
+        'success', true,
+        'email', p_email,
+        'username', p_username,
+        'message', 'User registered successfully'
+    );
+END;
+$$;
+
+// переделать айдишники игроков с ююид
+
+-- ============================================
+-- 1. СОЗДАНИЕ КОМНАТЫ (GAME)
+-- ============================================
+CREATE OR REPLACE FUNCTION create_game(
+    p_name VARCHAR(32),
+    p_max_players INTEGER DEFAULT 6,
+    p_max_turn_time INTEGER DEFAULT 30,  -- секунды
+    p_big_blind INTEGER DEFAULT 100,
+    p_min_stack INTEGER DEFAULT 1000,
+    p_max_stack INTEGER DEFAULT 10000
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_game_id UUID;
+BEGIN
+    -- Валидация параметров
+    IF p_max_players  2 OR p_max_players  10 THEN
+        RETURN json_build_object('success', false, 'error', 'Max players must be between 2 and 10');
+    END IF;
+    
+    IF p_max_turn_time  10 OR p_max_turn_time  300 THEN
+        RETURN json_build_object('success', false, 'error', 'Turn time must be between 10 and 300 seconds');
+    END IF;
+    
+    IF p_min_stack = p_max_stack THEN
+        RETURN json_build_object('success', false, 'error', 'Min stack must be less than max stack');
+    END IF;
+    
+    -- Создаем игру
+    INSERT INTO Games (
+        id, name, createdAt, max_players, max_turn_time, 
+        big_blind, min_stack, max_stack, pot, turn_start_time, current_player_id
+    )
+    VALUES (
+        gen_random_uuid(), p_name, NOW(), p_max_players, p_max_turn_time,
+        p_big_blind, p_min_stack, p_max_stack, 0, NULL, NULL
+    )
+    RETURNING id INTO v_game_id;
+    
+    RETURN json_build_object(
+        'success', true,
+        'game_id', v_game_id,
+        'name', p_name,
+        'max_players', p_max_players,
+        'big_blind', p_big_blind,
+        'message', 'Game created successfully'
+    );
+END;
+$$;
+
+-- ============================================
+-- 2. ВХОД ЗА СТОЛ (JOIN GAME)
+-- ============================================
+CREATE OR REPLACE FUNCTION join_game(
+    p_game_id UUID,
+    p_email VARCHAR(255),
+    p_buy_in INTEGER  -- Сумма, с которой игрок садится за стол
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_player_count INTEGER;
+    v_max_players INTEGER;
+    v_min_stack INTEGER;
+    v_max_stack INTEGER;
+    v_new_player_id UUID;
+    v_next_position INTEGER;
+BEGIN
+    -- Проверяем, существует ли пользователь
+    IF NOT EXISTS (SELECT 1 FROM Users WHERE email = p_email) THEN
+        RETURN json_build_object('success', false, 'error', 'User not found');
+    END IF;
+    
+    -- Проверяем лимиты игры
+    SELECT max_players, min_stack, max_stack 
+    INTO v_max_players, v_min_stack, v_max_stack
+    FROM Games 
+    WHERE id = p_game_id;
+    
+    IF NOT FOUND THEN
+        RETURN json_build_object('success', false, 'error', 'Game not found');
+    END IF;
+    
+    -- Проверяем количество игроков
+    SELECT COUNT() INTO v_player_count
+    FROM Players
+    WHERE game_id = p_game_id;
+    
+    -- Проверки
+    IF v_player_count = v_max_players THEN
+        RETURN json_build_object('success', false, 'error', 'Game is full');
+    END IF;
+    
+    IF p_buy_in  v_min_stack OR p_buy_in  v_max_stack THEN
+        RETURN json_build_object(
+            'success', false, 
+            'error', 'Buy-in must be between '  v_min_stack  ' and '  v_max_stack
+        );
+    END IF;
+    
+    -- Проверяем, не сидит ли игрок уже за столом
+    IF EXISTS (SELECT 1 FROM Players WHERE game_id = p_game_id AND email = p_email) THEN
+        RETURN json_build_object('success', false, 'error', 'Already at this table');
+    END IF;
+    
+    -- Определяем следующую позицию
+    SELECT COALESCE(MAX(position), 0) + 1 INTO v_next_position
+    FROM Players
+    WHERE game_id = p_game_id;
+    
+    -- Создаем игрока
+    INSERT INTO Players (id, position, status, email, game_id, stack, has_acted)
+    VALUES (gen_random_uuid(), v_next_position, 'CHECK', p_email, p_game_id, p_buy_in, FALSE)
+    RETURNING id INTO v_new_player_id;
+    
+    -- Обновляем активность пользователя
+    UPDATE Users SET last_activity = NOW() WHERE email = p_email;
+    
+    RETURN json_build_object(
+        'success', true,
+        'player_id', v_new_player_id,
+        'position', v_next_position,
+        'stack', p_buy_in
+    );
+END;
+$$;
+
+-- ============================================
+-- 3. ВЫХОД ИЗ-ЗА СТОЛА (LEAVE GAME)
+-- ============================================
+CREATE OR REPLACE FUNCTION leave_game(
+    p_player_id UUID
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_stack INTEGER;
+    v_game_id UUID;
+    v_current_player_id UUID;
+BEGIN
+    -- Получаем стек игрока
+    SELECT stack, game_id INTO v_stack, v_game_id
+    FROM Players
+    WHERE id = p_player_id;
+    
+    IF NOT FOUND THEN
+        RETURN json_build_object('success', false, 'error', 'Player not found');
+    END IF;
+    
+    -- Проверяем, не является ли этот игрок текущим
+    SELECT current_player_id INTO v_current_player_id
+    FROM Games
+    WHERE id = v_game_id;
+    
+    -- Если это текущий игрок, передаем ход следующему
+    IF v_current_player_id = p_player_id THEN
+        PERFORM next_turn(v_game_id);
+    END IF;
+    
+    -- Удаляем карты игрока
+    DELETE FROM Players_Cards WHERE player_id = p_player_id;
+    
+    -- Удаляем ставки игрока
+    DELETE FROM Bets WHERE player_id = p_player_id;
+    
+    -- Удаляем игрока
+    DELETE FROM Players WHERE id = p_player_id;
+    
+    RETURN json_build_object(
+        'success', true,
+        'stack_returned', v_stack,
+        'message', 'Player left the game'
+    );
+END;
+$$;
+
+-- ============================================
+-- 4. ПРОВЕРКА ТАЙМАУТА ХОДА
+-- ============================================
+CREATE OR REPLACE FUNCTION check_turn_timeout(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_turn_start_time TIMESTAMP;
+    v_max_turn_time INTEGER;
+    v_current_player_id UUID;
+    v_elapsed_seconds INTEGER;
+BEGIN
+    -- Получаем информацию о текущем ходе
+    SELECT turn_start_time, max_turn_time, current_player_id
+    INTO v_turn_start_time, v_max_turn_time, v_current_player_id
+    FROM Games
+    WHERE id = p_game_id;
+    
+    IF v_turn_start_time IS NULL THEN
+        RETURN json_build_object('success', true, 'timeout', false, 'message', 'No active turn');
+    END IF;
+    
+    -- Вычисляем прошедшее время
+    v_elapsed_seconds = EXTRACT(EPOCH FROM (NOW() - v_turn_start_time))INTEGER;
+    
+    -- Если время истекло
+    IF v_elapsed_seconds = v_max_turn_time THEN
+        -- Автоматически делаем FOLD для игрока
+        UPDATE Players 
+        SET status = 'FOLD'
+        WHERE id = v_current_player_id;
+        
+        -- Переходим к следующему игроку
+        PERFORM next_turn(p_game_id);
+        
+        RETURN json_build_object(
+            'success', true,
+            'timeout', true,
+            'player_id', v_current_player_id,
+            'action', 'Auto-folded due to timeout'
+        );
+    END IF;
+    
+    RETURN json_build_object(
+        'success', true,
+        'timeout', false,
+        'remaining_seconds', v_max_turn_time - v_elapsed_seconds
+    );
+END;
+$$;
+
+-- ============================================
+-- 5. ПЕРЕХОД К СЛЕДУЮЩЕМУ ИГРОКУ
+-- ============================================
+CREATE OR REPLACE FUNCTION next_turn(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_current_player_id UUID;
+    v_current_position INTEGER;
+    v_next_player_id UUID;
+    v_next_position INTEGER;
+    v_max_position INTEGER;
+    v_active_players_count INTEGER;
+BEGIN
+    -- Получаем текущего игрока
+    SELECT current_player_id INTO v_current_player_id
+    FROM Games
+    WHERE id = p_game_id;
+    
+    -- Получаем позицию текущего игрока
+    IF v_current_player_id IS NOT NULL THEN
+        SELECT position INTO v_current_position
+        FROM Players
+        WHERE id = v_current_player_id;
+    ELSE
+        v_current_position = 0;
+    END IF;
+    
+    -- Помечаем текущего игрока как сходившего
+    UPDATE Players 
+    SET has_acted = TRUE
+    WHERE id = v_current_player_id;
+    
+    -- Получаем максимальную позицию
+    SELECT MAX(position) INTO v_max_position
+    FROM Players
+    WHERE game_id = p_game_id;
+    
+    -- Ищем следующего активного игрока (не FOLD и еще не ходил)
+    SELECT id, position INTO v_next_player_id, v_next_position
+    FROM Players
+    WHERE game_id = p_game_id
+      AND status != 'FOLD'
+      AND position  v_current_position
+    ORDER BY position
+    LIMIT 1;
+    
+    -- Если не нашли (конец круга), начинаем сначала
+    IF v_next_player_id IS NULL THEN
+        SELECT id, position INTO v_next_player_id, v_next_position
+        FROM Players
+        WHERE game_id = p_game_id
+          AND status != 'FOLD'
+        ORDER BY position
+        LIMIT 1;
+    END IF;
+    
+    -- Проверяем, все ли игроки сходили
+    SELECT COUNT() INTO v_active_players_count
+    FROM Players
+    WHERE game_id = p_game_id
+      AND status != 'FOLD'
+      AND has_acted = FALSE;
+    
+    -- Если все сходили, завершаем раунд ставок
+    IF v_active_players_count = 0 THEN
+        -- Сбрасываем флаг has_acted для всех
+        UPDATE Players 
+        SET has_acted = FALSE
+        WHERE game_id = p_game_id;
+        
+        RETURN json_build_object(
+            'success', true,
+            'round_complete', true,
+            'message', 'Betting round complete'
+        );
+    END IF;
+    
+    -- Обновляем текущего игрока и время начала хода
+    UPDATE Games
+    SET current_player_id = v_next_player_id,
+        turn_start_time = NOW()
+    WHERE id = p_game_id;
+    
+    RETURN json_build_object(
+        'success', true,
+        'round_complete', false,
+        'current_player_id', v_next_player_id,
+        'position', v_next_position,
+        'turn_started_at', NOW()
+    );
+END;
+$$;
+
+-- ============================================
+-- 6. ДЕЙСТВИЯ ИГРОКА (с проверкой хода)
+-- ============================================
+
+-- 6.1 FOLD (Сброс карт)
+CREATE OR REPLACE FUNCTION player_fold(
+    p_player_id UUID
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_game_id UUID;
+    v_current_player_id UUID;
+BEGIN
+    -- Проверяем, что это ход игрока
+    SELECT game_id INTO v_game_id FROM Players WHERE id = p_player_id;
+    SELECT current_player_id INTO v_current_player_id FROM Games WHERE id = v_game_id;
+    
+    IF v_current_player_id != p_player_id THEN
+        RETURN json_build_object('success', false, 'error', 'Not your turn');
+    END IF;
+    
+    -- Меняем статус на FOLD
+    UPDATE Players 
+    SET status = 'FOLD'
+    WHERE id = p_player_id;
+    
+    -- Переходим к следующему игроку
+    PERFORM next_turn(v_game_id);
+    
+    RETURN json_build_object(
+        'success', true,
+        'action', 'FOLD',
+        'player_id', p_player_id
+    );
+END;
+$$;
+
+-- 6.2 CHECK (Пропуск без ставки)
+CREATE OR REPLACE FUNCTION player_check(
+    p_player_id UUID
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_current_bet INTEGER;
+    v_player_bet INTEGER;
+    v_game_id UUID;
+    v_current_player_id UUID;
+BEGIN
+    -- Проверяем, что это ход игрока
+    SELECT game_id INTO v_game_id FROM Players WHERE id = p_player_id;
+    SELECT current_player_id INTO v_current_player_id FROM Games WHERE id = v_game_id;
+    
+    IF v_current_player_id != p_player_id THEN
+        RETURN json_build_object('success', false, 'error', 'Not your turn');
+    END IF;
+    
+    -- Получаем текущую ставку игрока
+    SELECT COALESCE(amount, 0) INTO v_player_bet
+    FROM Bets
+    WHERE player_id = p_player_id;
+    
+    -- Проверяем, что можно сделать CHECK
+    SELECT COALESCE(MAX(amount), 0) INTO v_current_bet
+    FROM Bets b
+    JOIN Players p ON b.player_id = p.id
+    WHERE p.game_id = v_game_id;
+    
+    IF v_current_bet  v_player_bet THEN
+        RETURN json_build_object(
+            'success', false, 
+            'error', 'Cannot check, must call or raise',
+            'current_bet', v_current_bet,
+            'your_bet', v_player_bet
+        );
+    END IF;
+    
+    -- Меняем статус на CHECK
+    UPDATE Players 
+    SET status = 'CHECK'
+    WHERE id = p_player_id;
+    
+    -- Переходим к следующему игроку
+    PERFORM next_turn(v_game_id);
+    
+    RETURN json_build_object(
+        'success', true,
+        'action', 'CHECK',
+        'player_id', p_player_id
+    );
+END;
+$$;
+
+-- 6.3 CALL (Уравнять ставку)
+CREATE OR REPLACE FUNCTION player_call(
+    p_player_id UUID
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_current_bet INTEGER;
+    v_player_bet INTEGER;
+    v_to_call INTEGER;
+    v_player_stack INTEGER;
+    v_game_id UUID;
+    v_current_player_id UUID;
+BEGIN
+    -- Проверяем, что это ход игрока
+    SELECT stack, game_id INTO v_player_stack, v_game_id
+    FROM Players
+    WHERE id = p_player_id;
+    
+    SELECT current_player_id INTO v_current_player_id FROM Games WHERE id = v_game_id;
+    
+    IF v_current_player_id != p_player_id THEN
+        RETURN json_build_object('success', false, 'error', 'Not your turn');
+    END IF;
+    
+    -- Получаем текущую ставку игрока
+    SELECT COALESCE(amount, 0) INTO v_player_bet
+    FROM Bets
+    WHERE player_id = p_player_id;
+    
+    -- Получаем максимальную ставку за столом
+    SELECT COALESCE(MAX(amount), 0) INTO v_current_bet
+    FROM Bets b
+    JOIN Players p ON b.player_id = p.id
+    WHERE p.game_id = v_game_id;
+    
+    -- Вычисляем сумму для колла
+    v_to_call = v_current_bet - v_player_bet;
+    
+    IF v_to_call = 0 THEN
+        RETURN json_build_object('success', false, 'error', 'Nothing to call, use CHECK');
+    END IF;
+    
+    IF v_to_call > v_player_stack THEN
+        RETURN json_build_object(
+            'success', false, 
+            'error', 'Not enough chips',
+            'need', v_to_call,
+            'have', v_player_stack
+        );
+    END IF;
+    
+    -- Обновляем стек игрока
+    UPDATE Players 
+    SET stack = stack - v_to_call,
+        status = 'CALL'
+    WHERE id = p_player_id;
+    
+    -- Обновляемсоздаем ставку
+    INSERT INTO Bets (player_id, amount)
+    VALUES (p_player_id, v_current_bet)
+    ON CONFLICT (player_id) 
+    DO UPDATE SET amount = v_current_bet;
+    
+    -- Добавляем в банк
+    UPDATE Games 
+    SET pot = pot + v_to_call
+    WHERE id = v_game_id;
+    
+    -- Переходим к следующему игроку
+    PERFORM next_turn(v_game_id);
+    
+    RETURN json_build_object(
+        'success', true,
+        'action', 'CALL',
+        'amount', v_to_call,
+        'total_bet', v_current_bet,
+        'remaining_stack', v_player_stack - v_to_call
+    );
+END;
+$$;
+
+-- 6.4 RAISE (Повышение ставки)
+CREATE OR REPLACE FUNCTION player_raise(
+    p_player_id UUID,
+    p_raise_amount INTEGER  -- Сумма повышения (сверх текущей ставки)
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_current_bet INTEGER;
+    v_player_bet INTEGER;
+    v_new_bet INTEGER;
+    v_to_pay INTEGER;
+    v_player_stack INTEGER;
+    v_game_id UUID;
+    v_big_blind INTEGER;
+    v_current_player_id UUID;
+BEGIN
+    -- Проверяем, что это ход игрока
+    SELECT p.stack, p.game_id, g.big_blind 
+    INTO v_player_stack, v_game_id, v_big_blind
+    FROM Players p
+    JOIN Games g ON p.game_id = g.id
+    WHERE p.id = p_player_id;
+    
+    SELECT current_player_id INTO v_current_player_id FROM Games WHERE id = v_game_id;
+    
+    IF v_current_player_id != p_player_id THEN
+        RETURN json_build_object('success', false, 'error', 'Not your turn');
+    END IF;
+    
+    -- Получаем текущую ставку игрока
+    SELECT COALESCE(amount, 0) INTO v_player_bet
+    FROM Bets
+    WHERE player_id = p_player_id;
+    
+    -- Получаем максимальную ставку за столом
+    SELECT COALESCE(MAX(amount), 0) INTO v_current_bet
+    FROM Bets b
+    JOIN Players p ON b.player_id = p.id
+    WHERE p.game_id = v_game_id;
+    
+    -- Проверяем минимальный рейз
+    IF p_raise_amount  v_big_blind THEN
+        RETURN json_build_object(
+            'success', false, 
+            'error', 'Minimum raise is '  v_big_blind
+        );
+    END IF;
+    
+    -- Вычисляем новую ставку и сумму к оплате
+    v_new_bet = v_current_bet + p_raise_amount;
+    v_to_pay = v_new_bet - v_player_bet;
+    
+    IF v_to_pay > v_player_stack THEN
+        RETURN json_build_object(
+            'success', false, 
+            'error', 'Not enough chips',
+            'need', v_to_pay,
+            'have', v_player_stack
+        );
+    END IF;
+    
+    -- Обновляем стек игрока
+    UPDATE Players 
+    SET stack = stack - v_to_pay,
+        status = 'RAISE'
+    WHERE id = p_player_id;
+    
+    -- Обновляемсоздаем ставку
+    INSERT INTO Bets (player_id, amount)
+    VALUES (p_player_id, v_new_bet)
+    ON CONFLICT (player_id) 
+    DO UPDATE SET amount = v_new_bet;
+    
+    -- Добавляем в банк
+    UPDATE Games 
+    SET pot = pot + v_to_pay
+    WHERE id = v_game_id;
+    
+    -- Сбрасываем флаг has_acted для всех игроков (новый круг ставок)
+    UPDATE Players 
+    SET has_acted = FALSE
+    WHERE game_id = v_game_id AND status != 'FOLD';
+    
+    -- Помечаем текущего игрока как сходившего
+    UPDATE Players 
+    SET has_acted = TRUE
+    WHERE id = p_player_id;
+    
+    -- Переходим к следующему игроку
+    PERFORM next_turn(v_game_id);
+    
+    RETURN json_build_object(
+        'success', true,
+        'action', 'RAISE',
+        'raise_amount', p_raise_amount,
+        'total_bet', v_new_bet,
+        'paid', v_to_pay,
+        'remaining_stack', v_player_stack - v_to_pay
+    );
+END;
+$$;
+
+-- 6.5 ALL-IN (Ва-банк)
+CREATE OR REPLACE FUNCTION player_all_in(
+    p_player_id UUID
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_player_stack INTEGER;
+    v_player_bet INTEGER;
+    v_game_id UUID;
+    v_total_bet INTEGER;
+    v_current_player_id UUID;
+BEGIN
+    -- Проверяем, что это ход игрока
+    SELECT stack, game_id INTO v_player_stack, v_game_id
+    FROM Players
+    WHERE id = p_player_id;
+    
+    SELECT current_player_id INTO v_current_player_id FROM Games WHERE id = v_game_id;
+    
+    IF v_current_player_id != p_player_id THEN
+        RETURN json_build_object('success', false, 'error', 'Not your turn');
+    END IF;
+    
+    IF v_player_stack = 0 THEN
+        RETURN json_build_object('success', false, 'error', 'No chips left');
+    END IF;
+    
+    -- Получаем текущую ставку игрока
+    SELECT COALESCE(amount, 0) INTO v_player_bet
+    FROM Bets
+    WHERE player_id = p_player_id;
+    
+    v_total_bet = v_player_bet + v_player_stack;
+    
+    -- Обновляем игрока
+    UPDATE Players 
+    SET stack = 0,
+        status = 'ALL-IN'
+    WHERE id = p_player_id;
+    
+    -- Обновляем ставку
+    INSERT INTO Bets (player_id, amount)
+    VALUES (p_player_id, v_total_bet)
+    ON CONFLICT (player_id) 
+    DO UPDATE SET amount = v_total_bet;
+    
+    -- Добавляем в банк
+    UPDATE Games 
+    SET pot = pot + v_player_stack
+    WHERE id = v_game_id;
+    
+    -- Переходим к следующему игроку
+    PERFORM next_turn(v_game_id);
+    
+    RETURN json_build_object(
+        'success', true,
+        'action', 'ALL-IN',
+        'amount', v_player_stack,
+        'total_bet', v_total_bet
+    );
+END;
+$$;
+
+-- ============================================
+-- 7. ЗАМЕНА КАРТ (DRAW)
+-- ============================================
+CREATE OR REPLACE FUNCTION replace_cards(
+    p_player_id UUID,
+    p_card_ids_to_discard INTEGER[]  -- Массив ID карт для замены
+)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_game_id UUID;
+    v_card_id INTEGER;
+    v_new_card_id INTEGER;
+    v_discarded_count INTEGER;
+    v_new_cards JSON;
+    v_current_player_id UUID;
+BEGIN
+    -- Проверяем, что это ход игрока
+    SELECT game_id INTO v_game_id
+    FROM Players
+    WHERE id = p_player_id;
+    
+    SELECT current_player_id INTO v_current_player_id FROM Games WHERE id = v_game_id;
+    
+    IF v_current_player_id != p_player_id THEN
+        RETURN json_build_object('success', false, 'error', 'Not your turn');
+    END IF;
+    
+    IF NOT FOUND THEN
+        RETURN json_build_object('success', false, 'error', 'Player not found');
+    END IF;
+    
+    v_discarded_count = array_length(p_card_ids_to_discard, 1);
+    
+    -- Проверяем количество карт
+    IF v_discarded_count  5 THEN
+        RETURN json_build_object('success', false, 'error', 'Cannot discard more than 5 cards');
+    END IF;
+    
+    -- Если игрок не хочет менять карты
+    IF v_discarded_count = 0 OR v_discarded_count IS NULL THEN
+        -- Переходим к следующему игроку
+        PERFORM next_turn(v_game_id);
+        
+        RETURN json_build_object(
+            'success', true,
+            'message', 'No cards replaced',
+            'new_cards', '[]'json
+        );
+    END IF;
+    
+    -- Удаляем выбранные карты игрока
+    FOREACH v_card_id IN ARRAY p_card_ids_to_discard
+    LOOP
+        DELETE FROM Players_Cards 
+        WHERE player_id = p_player_id AND card_id = v_card_id;
+    END LOOP;
+    
+    -- Раздаем новые карты из колоды
+    FOR i IN 1..v_discarded_count LOOP
+        SELECT c.id INTO v_new_card_id
+        FROM Cards c
+        WHERE NOT EXISTS (
+            SELECT 1 FROM Players_Cards pc WHERE pc.card_id = c.id
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM Deck d WHERE d.card_id = c.id AND d.game_id = v_game_id
+        )
+        ORDER BY RANDOM()
+        LIMIT 1;
+        
+        INSERT INTO Players_Cards (card_id, player_id)
+        VALUES (v_new_card_id, p_player_id);
+    END LOOP;
+    
+    -- Получаем новые карты для ответа
+    SELECT json_agg(json_build_object('number', c.number, 'suit', c.suit))
+    INTO v_new_cards
+    FROM Players_Cards pc
+    JOIN Cards c ON pc.card_id = c.id
+    WHERE pc.player_id = p_player_id;
+    
+    -- Переходим к следующему игроку
+    PERFORM next_turn(v_game_id);
+    
+    RETURN json_build_object(
+        'success', true,
+        'discarded', v_discarded_count,
+        'new_cards', COALESCE(v_new_cards, '[]'json)
+    );
+END;
+$$;
+
+-- ============================================
+-- 8. ОПРЕДЕЛЕНИЕ ПОБЕДИТЕЛЯ (SHOWDOWN)
+-- ============================================
+
+-- Вспомогательная функция для оценки комбинации
+CREATE OR REPLACE FUNCTION evaluate_hand(p_player_id UUID)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_cards TEXT[];
+    v_suits TEXT[];
+    v_numbers TEXT[];
+    v_number_counts INTEGER[];
+    v_is_flush BOOLEAN = FALSE;
+    v_is_straight BOOLEAN = FALSE;
+    v_hand_rank INTEGER = 0;
+BEGIN
+    -- Получаем карты игрока
+    SELECT array_agg(c.number ORDER BY c.id), array_agg(c.suit ORDER BY c.id)
+    INTO v_numbers, v_suits
+    FROM Players_Cards pc
+    JOIN Cards c ON pc.card_id = c.id
+    WHERE pc.player_id = p_player_id;
+    
+    -- Проверяем флеш (все карты одной масти)
+    IF array_length(array(SELECT DISTINCT unnest(v_suits)), 1) = 1 THEN
+        v_is_flush = TRUE;
+    END IF;
+    
+    -- Упрощенная оценка (для полной реализации нужна более сложная логика)
+    -- Возвращаем базовый ранг (чем больше, тем лучше)
+    
+    -- Флеш = 5
+    IF v_is_flush THEN
+        v_hand_rank = 5;
+    ELSE
+        v_hand_rank = 1;  -- High card
+    END IF;
+    
+    RETURN v_hand_rank;
+END;
+$;
+
+-- Основная функция определения победителя
+CREATE OR REPLACE FUNCTION determine_winner(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_winner_id UUID;
+    v_winner_name VARCHAR;
+    v_pot INTEGER;
+    v_winner_hand_rank INTEGER;
+    v_player RECORD;
+    v_max_rank INTEGER = 0;
+    v_winners JSON;
+BEGIN
+    -- Получаем банк
+    SELECT pot INTO v_pot FROM Games WHERE id = p_game_id;
+    
+    -- Находим игроков, которые не сделали FOLD
+    FOR v_player IN 
+        SELECT p.id, u.username, p.stack
+        FROM Players p
+        JOIN Users u ON p.email = u.email
+        WHERE p.game_id = p_game_id AND p.status != 'FOLD'
+    LOOP
+        -- Оцениваем руку каждого игрока
+        v_winner_hand_rank = evaluate_hand(v_player.id);
+        
+        IF v_winner_hand_rank  v_max_rank THEN
+            v_max_rank = v_winner_hand_rank;
+            v_winner_id = v_player.id;
+            v_winner_name = v_player.username;
+        END IF;
+    END LOOP;
+    
+    -- Если есть победитель
+    IF v_winner_id IS NOT NULL THEN
+        -- Добавляем банк победителю
+        UPDATE Players 
+        SET stack = stack + v_pot
+        WHERE id = v_winner_id;
+        
+        -- Обнуляем банк и сбрасываем текущего игрока
+        UPDATE Games 
+        SET pot = 0,
+            current_player_id = NULL,
+            turn_start_time = NULL
+        WHERE id = p_game_id;
+        
+        -- Очищаем ставки
+        DELETE FROM Bets 
+        WHERE player_id IN (
+            SELECT id FROM Players WHERE game_id = p_game_id
+        );
+        
+        RETURN json_build_object(
+            'success', true,
+            'winner_id', v_winner_id,
+            'winner_name', v_winner_name,
+            'pot', v_pot,
+            'hand_rank', v_max_rank
+        );
+    ELSE
+        RETURN json_build_object(
+            'success', false,
+            'error', 'No active players'
+        );
+    END IF;
+END;
+$;
+
+-- ============================================
+-- 9. СБРОС РАУНДА (NEW ROUND)
+-- ============================================
+CREATE OR REPLACE FUNCTION new_round(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_first_player_id UUID;
+BEGIN
+    -- Удаляем все карты игроков
+    DELETE FROM Players_Cards 
+    WHERE player_id IN (
+        SELECT id FROM Players WHERE game_id = p_game_id
+    );
+    
+    -- Удаляем карты со стола
+    DELETE FROM Deck WHERE game_id = p_game_id;
+    
+    -- Сбрасываем статусы игроков и флаг has_acted
+    UPDATE Players 
+    SET status = 'CHECK',
+        has_acted = FALSE
+    WHERE game_id = p_game_id;
+    
+    -- Очищаем ставки
+    DELETE FROM Bets 
+    WHERE player_id IN (
+        SELECT id FROM Players WHERE game_id = p_game_id
+    );
+    
+    -- Получаем первого игрока
+    SELECT id INTO v_first_player_id
+    FROM Players
+    WHERE game_id = p_game_id
+    ORDER BY position
+    LIMIT 1;
+    
+    -- Обнуляем банк и устанавливаем первого игрока
+    UPDATE Games 
+    SET pot = 0,
+        current_player_id = v_first_player_id,
+        turn_start_time = NOW()
+    WHERE id = p_game_id;
+    
+    RETURN json_build_object(
+        'success', true,
+        'message', 'New round started',
+        'first_player_id', v_first_player_id
+    );
+END;
+$;
+
+-- ============================================
+-- 10. РАЗДАЧА КАРТ (DEAL CARDS)
+-- ============================================
+CREATE OR REPLACE FUNCTION deal_cards(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_player RECORD;
+    v_card_id INTEGER;
+    v_cards_dealt INTEGER = 0;
+BEGIN
+    -- Проверяем, не розданы ли уже карты
+    IF EXISTS (
+        SELECT 1 FROM Players_Cards pc
+        JOIN Players p ON pc.player_id = p.id
+        WHERE p.game_id = p_game_id
+    ) THEN
+        RETURN json_build_object('success', false, 'error', 'Cards already dealt');
+    END IF;
+
+    -- Раздаем по 5 карт каждому игроку
+    FOR v_player IN
+        SELECT id FROM Players
+        WHERE game_id = p_game_id
+        ORDER BY position
+    LOOP
+        -- Раздаем 5 карт текущему игроку
+        FOR i IN 1..5 LOOP
+            -- Выбираем случайную карту, которая еще не роздана
+            SELECT c.id INTO v_card_id
+            FROM Cards c
+            WHERE NOT EXISTS (
+                SELECT 1 FROM Players_Cards pc WHERE pc.card_id = c.id
+            )
+            ORDER BY RANDOM()
+            LIMIT 1;
+
+            -- Проверяем, что карта найдена
+            IF v_card_id IS NULL THEN
+                RETURN json_build_object(
+                    'success', false,
+                    'error', 'Not enough cards in deck',
+                    'cards_dealt', v_cards_dealt
+                );
+            END IF;
+
+            -- Добавляем карту игроку
+            INSERT INTO Players_Cards (card_id, player_id)
+            VALUES (v_card_id, v_player.id);
+
+            v_cards_dealt = v_cards_dealt + 1;
+        END LOOP;
+    END LOOP;
+
+    RETURN json_build_object(
+        'success', true,
+        'message', 'Cards dealt successfully',
+        'total_cards_dealt', v_cards_dealt
+    );
+END;
+$;
+
+-- ============================================
+-- 11. НАЧАЛО ИГРЫ (START GAME)
+-- ============================================
+CREATE OR REPLACE FUNCTION start_game(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_player_count INTEGER;
+    v_first_player_id UUID;
+    v_deal_result JSON;
+BEGIN
+    -- Проверяем количество игроков
+    SELECT COUNT() INTO v_player_count
+    FROM Players
+    WHERE game_id = p_game_id;
+    
+    IF v_player_count  2 THEN
+        RETURN json_build_object('success', false, 'error', 'Need at least 2 players to start');
+    END IF;
+    
+    -- Раздаем карты
+    SELECT deal_cards(p_game_id) INTO v_deal_result;
+    
+    IF (v_deal_result-'success')boolean = false THEN
+        RETURN v_deal_result;
+    END IF;
+    
+    -- Получаем первого игрока
+    SELECT id INTO v_first_player_id
+    FROM Players
+    WHERE game_id = p_game_id
+    ORDER BY position
+    LIMIT 1;
+    
+    -- Устанавливаем первого игрока и начинаем отсчет времени
+    UPDATE Games
+    SET current_player_id = v_first_player_id,
+        turn_start_time = NOW()
+    WHERE id = p_game_id;
+    
+    RETURN json_build_object(
+        'success', true,
+        'message', 'Game started',
+        'first_player_id', v_first_player_id,
+        'players_count', v_player_count
+    );
+END;
+$;
+
+-- ============================================
+-- 12. ПОЛУЧЕНИЕ СПИСКА ДОСТУПНЫХ ИГР
+-- ============================================
+CREATE OR REPLACE FUNCTION get_available_games()
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_games JSON;
+BEGIN
+    SELECT json_agg(
+        json_build_object(
+            'game_id', g.id,
+            'name', g.name,
+            'created_at', g.createdAt,
+            'max_players', g.max_players,
+            'current_players', (
+                SELECT COUNT() FROM Players WHERE game_id = g.id
+            ),
+            'big_blind', g.big_blind,
+            'min_stack', g.min_stack,
+            'max_stack', g.max_stack,
+            'pot', g.pot,
+            'is_full', (
+                SELECT COUNT() FROM Players WHERE game_id = g.id
+            ) = g.max_players
+        ) ORDER BY g.createdAt DESC
+    ) INTO v_games
+    FROM Games g;
+    
+    RETURN COALESCE(v_games, '[]'json);
+END;
+$;
+
+-- ============================================
+-- 13. ПОЛУЧЕНИЕ ИНФОРМАЦИИ ОБ ИГРОКЕ
+-- ============================================
+CREATE OR REPLACE FUNCTION get_player_info(p_email VARCHAR)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    v_user_info JSON;
+    v_current_games JSON;
+BEGIN
+    -- Получаем информацию о пользователе
+    SELECT json_build_object(
+        'email', u.email,
+        'username', u.username,
+        'last_activity', u.last_activity
+    ) INTO v_user_info
+    FROM Users u
+    WHERE u.email = p_email;
+    
+    IF v_user_info IS NULL THEN
+        RETURN json_build_object('success', false, 'error', 'User not found');
+    END IF;
+    
+    -- Получаем активные игры пользователя
+    SELECT json_agg(
+        json_build_object(
+            'game_id', g.id,
+            'game_name', g.name,
+            'player_id', p.id,
+            'position', p.position,
+            'stack', p.stack,
+            'status', p.status
+        )
+    ) INTO v_current_games
+    FROM Players p
+    JOIN Games g ON p.game_id = g.id
+    WHERE p.email = p_email;
+    
+    RETURN json_build_object(
+        'success', true,
+        'user', v_user_info,
+        'active_games', COALESCE(v_current_games, '[]'json)
+    );
+END;
+$;
+
+получить состояние игры 
+
+CREATE OR REPLACE FUNCTION get_game_state_json(p_game_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+AS $
+DECLARE
+    result JSON;
+BEGIN
+    SELECT json_build_object(
+        'game', json_build_object(
+            'id', g.id,
+            'name', g.name,
+            'created_at', g.createdAt,
+            'max_players', g.max_players,
+            'max_turn_time', g.max_turn_time,
+            'big_blind', g.big_blind,
+            'min_stack', g.min_stack,
+            'max_stack', g.max_stack,
+            'pot', g.pot,
+            'remaining_turn_time', GREATEST(
+                g.max_turn_time - EXTRACT(EPOCH FROM (NOW() - g.turn_start_time)),
+                0
+            ) 
+        ),
+        'players', (
+            SELECT COALESCE(json_agg(
+                json_build_object(
+                    'id', p.id,
+                    'username', u.username,
+                    'email', p.email,
+                    'position', p.position,
+                    'status', p.status,
+                    'stack', p.stack,
+                    'bet', COALESCE(b.amount, 0),
+                    'cards_count', (
+                        -- Количество карт у игрока (для других игроков видим только количество)
+                        SELECT COUNT(*)
+                        FROM Players_Cards pc
+                        WHERE pc.player_id = p.id
+                    ),
+                    'cards', (
+                        -- Карты игрока (видны только самому игроку)
+                        SELECT COALESCE(json_agg(
+                            json_build_object(
+                                'number', c2.number,
+                                'suit', c2.suit
+                            )
+                        ), '[]'::json)
+                        FROM Players_Cards pc
+                        JOIN Cards c2 ON pc.card_id = c2.id
+                        WHERE pc.player_id = p.id
+                    )
+                ) ORDER BY p.position
+            ), '[]'::json)
+            FROM Players p
+            JOIN Users u ON p.email = u.email
+            LEFT JOIN Bets b ON p.id = b.player_id
+            WHERE p.game_id = p_game_id
+        )
+    ) INTO result
+    FROM Games g
+    WHERE g.id = p_game_id;
+    
+    RETURN result;
+END;
+$;

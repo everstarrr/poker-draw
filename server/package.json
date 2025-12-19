@@ -1,0 +1,36 @@
+{
+  "name": "@solana-poker-draw/server",
+  "version": "1.0.0",
+  "description": "Solana Poker Draw - Server",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx watch src/app.ts",
+    "start": "tsx src/app.ts",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "init-cards": "tsx src/scripts/initCards.ts",
+    "migrate-balance": "tsx src/scripts/applyBalanceMigration.ts",
+    "fix-replace-cards": "tsx src/scripts/fixReplaceCards.ts",
+    "cleanup-cards": "tsx src/scripts/cleanupCards.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "pg": "^8.16.3",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.4",
+    "@types/node": "^24.9.1",
+    "@types/pg": "^8.15.6",
+    "@types/ssh2": "^1.15.5",
+    "nodemon": "^3.1.10",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

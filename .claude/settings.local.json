@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm fix-replace-cards:*)",
+      "Bash(pnpm init-cards:*)",
+      "Bash(npx tsx:*)",
+      "Bash(pnpm --filter server cleanup-cards:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
