@@ -1,5 +1,8 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
+import { bindWebSocketServer } from './ws/hub.js';
 import { initializeDatabase } from './config/database.js';
 import { userRoutes } from './routes/userRoutes.js';
 import { gameRoutes } from './routes/gameRoutes.js';
@@ -42,13 +45,20 @@ app.use((req: Request, res: Response) => {
   res.status(404).json({ success: false, error: 'Route not found' });
 });
 
-// Initialize database and start server
+// Initialize database and start server with WebSocket
 async function startServer() {
   try {
     await initializeDatabase();
-    app.listen(PORT, () => {
+    const server = createServer(app);
+
+    // Bind WebSocket hub for game orchestration
+    const wss = new WebSocketServer({ server, path: '/ws' });
+    bindWebSocketServer(wss);
+
+    server.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Health check: http://localhost:${PORT}/health`);
+      console.log(`WebSocket listening on ws://localhost:${PORT}/ws`);
     });
   } catch (error) {
     console.error('Failed to start server:', error);

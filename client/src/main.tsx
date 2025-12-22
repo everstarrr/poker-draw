@@ -1,11 +1,22 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import './index.css'
+import Login from './pages/auth/login.tsx'
+import Register from './pages/auth/register.tsx'
+import RoomsList from './pages/rooms/rooms-list.tsx'
 import PokerTable from './pages/table/poker-table.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    {/* <App /> */}
-    <PokerTable/>
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route path="/register" element={<Register />} />
+        <Route path="/rooms" element={<RoomsList />} />
+        <Route path="/table/:roomId" element={<PokerTable />} />
+        <Route path="/" element={<Navigate to="/login" replace />} />
+      </Routes>
+    </BrowserRouter>
   </StrictMode>,
 )

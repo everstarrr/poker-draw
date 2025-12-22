@@ -10,8 +10,22 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "init-cards": "tsx src/scripts/initCards.ts",
     "migrate-balance": "tsx src/scripts/applyBalanceMigration.ts",
+    "migrate-login": "tsx src/scripts/applyLoginMigration.ts",
+    "migrate-created-by": "tsx src/scripts/applyCreatedByMigration.ts",
+    "migrate-cards-visibility": "tsx src/scripts/applyCardsVisibilityMigration.ts",
+    "update-dealing": "tsx src/scripts/applyDealingUpdate.ts",
+    "update-next-turn": "tsx src/scripts/applyNextTurnUpdate.ts",
+    "update-state-func": "tsx src/scripts/applyStateFunctionUpdate.ts",
+    "migrate-blinds": "tsx src/scripts/applyBlindsMigration.ts",
+    "update-new-round": "tsx src/scripts/applyNewRoundUpdate.ts",
+    "update-balance-settlement": "tsx src/scripts/applyBalanceSettlementUpdate.ts",
+    "update-blinds-flag": "tsx src/scripts/applyBlindsFlagUpdate.ts",
+    "update-actions-no-pot": "tsx src/scripts/applyActionsNoPotUpdate.ts",
+    "migrate-phase": "tsx src/scripts/applyPhaseMigration.ts",
+    "update-cards-visibility-showdown": "tsx src/scripts/applyCardsVisibilityShowdownUpdate.ts",
     "fix-replace-cards": "tsx src/scripts/fixReplaceCards.ts",
-    "cleanup-cards": "tsx src/scripts/cleanupCards.ts"
+    "cleanup-cards": "tsx src/scripts/cleanupCards.ts",
+    "clear-games": "tsx src/scripts/clearGames.ts"
   },
   "keywords": [],
   "author": "",
@@ -21,7 +35,8 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "pg": "^8.16.3",
-    "ssh2": "^1.17.0"
+    "ssh2": "^1.17.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
@@ -29,6 +44,7 @@
     "@types/node": "^24.9.1",
     "@types/pg": "^8.15.6",
     "@types/ssh2": "^1.15.5",
+    "@types/ws": "^8.18.1",
     "nodemon": "^3.1.10",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"

@@ -21,6 +21,11 @@ router.post('/:game_id/join', GameController.joinGame);
 // POST /api/games/players/:player_id/leave - Выход из игры
 router.post('/players/:player_id/leave', GameController.leaveGame);
 
+// POST /api/games/:game_id/leave - Выход из игры по email
+router.post('/:game_id/leave', GameController.leaveGameByEmail);
+// GET /api/games/:game_id/leave?email=... - Выход из игры по email (для простых проверок)
+router.get('/:game_id/leave', GameController.leaveGameByEmail);
+
 // POST /api/games/players/:player_id/actions/fold - Сброс карт
 router.post('/players/:player_id/actions/fold', GameController.playerFold);
 

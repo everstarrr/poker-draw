@@ -3,6 +3,9 @@ import { UserController } from '../controllers/userController.js';
 
 const router = Router();
 
+// POST /api/users/login - Вход пользователя
+router.post('/login', UserController.loginUser);
+
 // POST /api/users/register - Регистрация пользователя
 router.post('/register', UserController.registerUser);
 

@@ -523,10 +523,7 @@ BEGIN
     ON CONFLICT (player_id) 
     DO UPDATE SET amount = v_current_bet;
     
-    -- Добавляем в банк
-    UPDATE Games 
-    SET pot = pot + v_to_call
-    WHERE id = v_game_id;
+    -- Не добавляем в банк в середине раунда; банк начисляется при завершении раунда ставок
     
     -- Переходим к следующему игроку
     PERFORM next_turn(v_game_id);
@@ -616,10 +613,7 @@ BEGIN
     ON CONFLICT (player_id) 
     DO UPDATE SET amount = v_new_bet;
     
-    -- Добавляем в банк
-    UPDATE Games 
-    SET pot = pot + v_to_pay
-    WHERE id = v_game_id;
+    -- Не добавляем в банк в середине раунда; банк начисляется при завершении раунда ставок
     
     -- Сбрасываем флаг has_acted для всех игроков (новый круг ставок)
     UPDATE Players 
@@ -693,10 +687,7 @@ BEGIN
     ON CONFLICT (player_id) 
     DO UPDATE SET amount = v_total_bet;
     
-    -- Добавляем в банк
-    UPDATE Games 
-    SET pot = pot + v_player_stack
-    WHERE id = v_game_id;
+    -- Не добавляем в банк в середине раунда; банк начисляется при завершении раунда ставок
     
     -- Переходим к следующему игроку
     PERFORM next_turn(v_game_id);

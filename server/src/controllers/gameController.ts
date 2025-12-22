@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { db } from '../config/database.js';
+import { pushGameState, startTurnTimer, checkAndHandleWinner, ensureBlindsPublic } from '../ws/hub.js';
 
 export class GameController {
   // Создание игры
@@ -14,20 +15,37 @@ export class GameController {
         max_stack = 10000,
       } = req.body;
 
+      const creatorEmailRaw = req.headers['x-user-email'];
+      const creatorEmail = typeof creatorEmailRaw === 'string' ? creatorEmailRaw : undefined;
+
+      if (!creatorEmail) {
+        res.status(401).json({ success: false, error: 'Creator email required' });
+        return;
+      }
+
       if (!name) {
         res.status(400).json({ success: false, error: 'Game name is required' });
         return;
       }
 
       const result = await db.query(
-        'SELECT create_game($1, $2, $3, $4, $5, $6) as result',
-        [name, max_players, max_turn_time, big_blind, min_stack, max_stack]
+        'SELECT create_game_with_creator($1, $2, $3, $4, $5, $6, $7) as result',
+        [name, max_players, max_turn_time, big_blind, min_stack, max_stack, creatorEmail]
       );
 
       const response = result[0].result;
 
       if (response.success) {
         res.json(response);
+        // Auto-join creator into the newly created game with default buy-in (min_stack)
+        try {
+          const gameId: string | undefined = response?.game_id;
+          const buyIn = Number(min_stack) || 0;
+          if (gameId && creatorEmail && buyIn > 0) {
+            try { await db.query('SELECT join_game($1, $2, $3) as result', [gameId, creatorEmail, buyIn]); } catch {}
+            try { await pushGameState(gameId); } catch {}
+          }
+        } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -54,11 +72,15 @@ export class GameController {
   static async getGameState(req: Request, res: Response): Promise<void> {
     try {
       const { game_id } = req.params;
+      const emailHeader = req.headers['x-user-email'];
+      const viewerEmail = typeof emailHeader === 'string' ? emailHeader : undefined;
 
-      const result = await db.query(
-        'SELECT get_game_state_json($1) as result',
-        [game_id]
-      );
+      let result;
+      if (viewerEmail) {
+        result = await db.query('SELECT get_game_state_for_email($1, $2) as result', [game_id, viewerEmail]);
+      } else {
+        result = await db.query('SELECT get_game_state_public($1) as result', [game_id]);
+      }
 
       const gameState = result[0].result;
 
@@ -88,6 +110,11 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try {
+          await pushGameState(game_id);
+          await ensureBlindsPublic(game_id);
+          await startTurnTimer(game_id);
+        } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -111,6 +138,11 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try {
+          await pushGameState(game_id);
+          await ensureBlindsPublic(game_id);
+          await startTurnTimer(game_id);
+        } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -140,6 +172,10 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try {
+          await pushGameState(game_id);
+          await startTurnTimer(game_id);
+        } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -154,6 +190,10 @@ export class GameController {
     try {
       const { player_id } = req.params;
 
+      // Fetch game_id before deleting
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
+
       const result = await db.query(
         'SELECT leave_game($1) as result',
         [player_id]
@@ -163,6 +203,13 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try {
+          if (game_id) {
+            await pushGameState(game_id);
+            await checkAndHandleWinner(game_id);
+            await startTurnTimer(game_id);
+          }
+        } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -172,10 +219,61 @@ export class GameController {
     }
   }
 
+  // Выход из игры по email + game_id (удобно для фронтенда)
+  static async leaveGameByEmail(req: Request, res: Response): Promise<void> {
+    try {
+      const { game_id } = req.params;
+      const emailInput = (req.body as any)?.email ?? (req.query as any)?.email ?? (req.headers['x-user-email'] as string | undefined);
+      const email = typeof emailInput === 'string' ? emailInput : undefined;
+
+      if (!game_id || !email) {
+        res.status(400).json({ success: false, error: 'game_id and email are required' });
+        return;
+      }
+
+      // Находим player_id по game_id и email
+      const rows = await db.query(
+        'SELECT id, game_id FROM players WHERE game_id = $1 AND lower(email) = lower($2) ORDER BY id DESC LIMIT 1',
+        [game_id, email]
+      );
+
+      if (!rows || rows.length === 0) {
+        // Игрок уже вышел — считаем успешным выходом
+        res.json({ success: true, message: 'Already left or not in game' });
+        return;
+      }
+
+      const pid = rows[0].id;
+      const gid: string | undefined = rows[0].game_id;
+      const result = await db.query('SELECT leave_game($1) as result', [pid]);
+      const response = result[0].result;
+
+      if (response.success) {
+        res.json(response);
+        try {
+          if (gid) {
+            await pushGameState(gid);
+            await checkAndHandleWinner(gid);
+            await startTurnTimer(gid);
+          }
+        } catch {}
+      } else {
+        res.status(400).json(response);
+      }
+    } catch (error) {
+      console.error('Leave game by email error:', error);
+      res.status(500).json({ success: false, error: 'Internal server error' });
+    }
+  }
+
   // Сброс карт (FOLD)
   static async playerFold(req: Request, res: Response): Promise<void> {
     try {
       const { player_id } = req.params;
+
+      // Resolve game_id for broadcasting
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
 
       const result = await db.query(
         'SELECT player_fold($1) as result',
@@ -186,6 +284,13 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try {
+          if (game_id) {
+            await pushGameState(game_id);
+            await checkAndHandleWinner(game_id);
+            await startTurnTimer(game_id);
+          }
+        } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -200,6 +305,9 @@ export class GameController {
     try {
       const { player_id } = req.params;
 
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
+
       const result = await db.query(
         'SELECT player_check($1) as result',
         [player_id]
@@ -209,6 +317,7 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try { if (game_id) { await pushGameState(game_id); await checkAndHandleWinner(game_id); await startTurnTimer(game_id); } } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -223,6 +332,9 @@ export class GameController {
     try {
       const { player_id } = req.params;
 
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
+
       const result = await db.query(
         'SELECT player_call($1) as result',
         [player_id]
@@ -232,6 +344,7 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try { if (game_id) { await pushGameState(game_id); await checkAndHandleWinner(game_id); await startTurnTimer(game_id); } } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -252,6 +365,9 @@ export class GameController {
         return;
       }
 
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
+
       const result = await db.query(
         'SELECT player_raise($1, $2) as result',
         [player_id, raise_amount]
@@ -261,6 +377,7 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try { if (game_id) { await pushGameState(game_id); await checkAndHandleWinner(game_id); await startTurnTimer(game_id); } } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -275,6 +392,9 @@ export class GameController {
     try {
       const { player_id } = req.params;
 
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
+
       const result = await db.query(
         'SELECT player_all_in($1) as result',
         [player_id]
@@ -284,6 +404,7 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try { if (game_id) { await pushGameState(game_id); await checkAndHandleWinner(game_id); await startTurnTimer(game_id); } } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -301,6 +422,9 @@ export class GameController {
 
       const cardIds = Array.isArray(card_ids_to_discard) ? card_ids_to_discard : [];
 
+      const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
+      const game_id: string | undefined = gidRows?.[0]?.game_id;
+
       const result = await db.query(
         'SELECT replace_cards($1, $2) as result',
         [player_id, cardIds]
@@ -310,6 +434,7 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try { if (game_id) { await pushGameState(game_id); await checkAndHandleWinner(game_id); await startTurnTimer(game_id); } } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -333,6 +458,7 @@ export class GameController {
 
       if (response.success) {
         res.json(response);
+        try { await pushGameState(game_id); await checkAndHandleWinner(game_id); await startTurnTimer(game_id); } catch {}
       } else {
         res.status(400).json(response);
       }
@@ -392,12 +518,43 @@ export class GameController {
   static async deleteGame(req: Request, res: Response): Promise<void> {
     try {
       const { game_id } = req.params;
+      const requesterRaw = req.headers['x-user-email'];
+      const requesterEmail = typeof requesterRaw === 'string' ? requesterRaw : undefined;
 
-      const result = await db.query(
-        'DELETE FROM games WHERE id = $1 RETURNING id',
-        [game_id]
-      );
+      if (!requesterEmail) {
+        res.status(401).json({ success: false, error: 'Email header required' });
+        return;
+      }
 
+      // Fetch game creator and players count
+      const gameRows = await db.query('SELECT created_by FROM games WHERE id = $1', [game_id]);
+      if (!gameRows || gameRows.length === 0) {
+        res.status(404).json({ success: false, error: 'Game not found' });
+        return;
+      }
+
+      const createdBy: string | null = gameRows[0].created_by || null;
+      const playersCountRows = await db.query('SELECT COUNT(*)::int AS cnt FROM players WHERE game_id = $1', [game_id]);
+      const playersCount: number = playersCountRows?.[0]?.cnt ?? 0;
+
+      // Allow deletion when room is truly empty, or when the only player is the creator
+      if (playersCount > 0) {
+        const players = await db.query('SELECT id, email FROM players WHERE game_id = $1', [game_id]);
+        // If exactly one player and it is the creator, auto-leave them before deleting
+        if (playersCount === 1 && players?.[0]?.email && createdBy && players[0].email.toLowerCase() === createdBy.toLowerCase()) {
+          try { await db.query('SELECT leave_game($1) as result', [players[0].id]); } catch {}
+        } else {
+          res.status(400).json({ success: false, error: 'Room must be empty to delete' });
+          return;
+        }
+      }
+
+      if (!createdBy || createdBy.toLowerCase() !== requesterEmail.toLowerCase()) {
+        res.status(403).json({ success: false, error: 'Only creator can delete this game' });
+        return;
+      }
+
+      const result = await db.query('DELETE FROM games WHERE id = $1 RETURNING id', [game_id]);
       if (result.length > 0) {
         res.json({ success: true, message: 'Game deleted successfully', game_id });
       } else {

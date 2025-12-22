@@ -2,6 +2,36 @@ import { Request, Response } from "express";
 import { db } from "../config/database.js";
 
 export class UserController {
+  // Вход пользователя
+  static async loginUser(req: Request, res: Response): Promise<void> {
+    try {
+      const { email, password } = req.body;
+
+      if (!email || !password) {
+        res
+          .status(400)
+          .json({ success: false, error: "Email and password are required" });
+        return;
+      }
+
+      const result = await db.query(
+        "SELECT login_user($1, $2) as result",
+        [email, password]
+      );
+
+      const response = result[0].result;
+
+      if (response.success) {
+        res.json(response);
+      } else {
+        res.status(401).json(response);
+      }
+    } catch (error) {
+      console.error("Login user error:", error);
+      res.status(500).json({ success: false, error: "Internal server error" });
+    }
+  }
+
   // Регистрация пользователя
   static async registerUser(req: Request, res: Response): Promise<void> {
     try {
