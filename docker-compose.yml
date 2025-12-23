@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    env_file: .env
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    expose:
+      - 80
+    networks:
+      - default
+      - nginx-proxy
+    env_file: .env
+    depends_on:
+      - server
+    restart: unless-stopped
+
+networks:
+  nginx-proxy:
+    external: true
