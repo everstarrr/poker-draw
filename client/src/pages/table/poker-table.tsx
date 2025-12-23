@@ -277,14 +277,23 @@ const PokerTable: React.FC = () => {
   }, [roomId]);
 
   // Local stable countdown based on server turn_start_time and max_turn_time
+  // Only compute locally when we don't have a server timer AND we have the necessary data
   useEffect(() => {
-    if (hasServerTimer) return; // Prefer server timer when available
-    if (!turnStartTs || !maxTurnTimeSec) return;
+    // Prefer server-sent timer; only fallback to local calculation
+    if (hasServerTimer || !turnStartTs || !maxTurnTimeSec) {
+      return;
+    }
+    
+    // Synchronize local timer with current server-provided remaining time
     const tick = setInterval(() => {
       const elapsed = Math.floor((Date.now() - turnStartTs) / 1000);
       const remain = Math.max(0, maxTurnTimeSec - elapsed);
-      setTurnRemaining(remain);
-    }, 1000);
+      // Only update if the value actually changed to avoid unnecessary re-renders
+      setTurnRemaining((prev) => {
+        const newVal = remain;
+        return prev !== newVal ? newVal : prev;
+      });
+    }, 100); // Check every 100ms for smoother updates instead of 1s jumps
     return () => clearInterval(tick);
   }, [turnStartTs, maxTurnTimeSec, hasServerTimer]);
 

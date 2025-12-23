@@ -249,7 +249,6 @@ export async function startTurnTimer(gameId: string, seconds = 30) {
               winnerId = pidRows?.[0]?.id || null;
             }
             const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
-            const room = getRoom(gameId);
             for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(payload); }
             setTimeout(async () => {
               try {
@@ -276,8 +275,8 @@ export async function startTurnTimer(gameId: string, seconds = 30) {
             const emailRows = await db.query('SELECT email FROM players WHERE id = $1', [winnerId]);
             const winnerEmail = emailRows?.[0]?.email || null;
             const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
-            const room = getRoom(gameId);
-            for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(payload); }
+            const gameRoom = getRoom(gameId);
+            for (const ws of gameRoom.clients) { if (ws.readyState === ws.OPEN) ws.send(payload); }
             setTimeout(async () => {
               try {
                 await db.query('SELECT new_round($1) as result', [gameId]);
