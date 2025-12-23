@@ -12,9 +12,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.client
-    ports:
-      - "8080:80"
+    expose:
+      - 80
+    networks:
+      - default
+      - nginx-proxy
     env_file: .env
     depends_on:
       - server
     restart: unless-stopped
+
+networks:
+  nginx-proxy:
+    external: true
