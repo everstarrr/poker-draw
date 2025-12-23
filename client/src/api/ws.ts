@@ -8,7 +8,7 @@ function toWsUrl(httpUrl: string): string {
 }
 
 export function connectGameSocket(gameId: string, email: string): WebSocket {
-  const base = API_BASE_URL || 'http://localhost:3000';
+  const base = API_BASE_URL || 'https://poker.whsrv.ru';
   const wsBase = toWsUrl(base);
   const url = `${wsBase}/ws?game_id=${encodeURIComponent(gameId)}&email=${encodeURIComponent(email)}`;
   const socket = new WebSocket(url);
