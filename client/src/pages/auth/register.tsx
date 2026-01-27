@@ -64,20 +64,20 @@ const Register: React.FC = () => {
   };
 
   return (
-    <div className="w-screen h-screen bg-background flex items-center justify-center p-4">
+    <div className="w-screen h-screen bg-[#070707] flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        <div className="bg-gray-900 rounded-lg shadow-xl p-8 border border-gray-800">
+        <div className="bg-[#1a1a1a] rounded-lg shadow-xl p-8 border border-gray-700">
           {/* Заголовок */}
           <div className="text-center mb-8">
-            <h1 className="text-4xl font-bold text-white mb-2">♠ Покер Дро ♠</h1>
-            <p className="text-gray-400">Создайте новый аккаунт</p>
+            <h1 className="text-4xl font-bold text-[#ffffff] mb-2">♠ Покер Дро ♠</h1>
+            <p className="text-[#9ca3af]">Создайте новый аккаунт</p>
           </div>
 
           {/* Форма */}
           <form onSubmit={handleSubmit} className="space-y-6">
             {/* Поле email */}
             <div>
-              <label htmlFor="email" className="block text-sm font-medium text-gray-300 mb-2">
+              <label htmlFor="email" className="block text-sm font-medium text-[#d1d5db] mb-2">
                 Email
               </label>
               <input
@@ -87,14 +87,14 @@ const Register: React.FC = () => {
                 value={formData.email}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+                className="w-full px-4 py-3 bg-[#2d2d2d] border border-gray-600 rounded-lg text-[#ffffff] placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
                 placeholder="Введите email"
               />
             </div>
 
             {/* Поле логина */}
             <div>
-              <label htmlFor="username" className="block text-sm font-medium text-gray-300 mb-2">
+              <label htmlFor="username" className="block text-sm font-medium text-[#d1d5db] mb-2">
                 Имя пользователя
               </label>
               <input
@@ -105,14 +105,14 @@ const Register: React.FC = () => {
                 onChange={handleChange}
                 required
                 minLength={3}
-                className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+                className="w-full px-4 py-3 bg-[#2d2d2d] border border-gray-600 rounded-lg text-[#ffffff] placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
                 placeholder="Минимум 3 символа"
               />
             </div>
 
             {/* Поле пароля */}
             <div>
-              <label htmlFor="password" className="block text-sm font-medium text-gray-300 mb-2">
+              <label htmlFor="password" className="block text-sm font-medium text-[#d1d5db] mb-2">
                 Пароль
               </label>
               <input
@@ -123,14 +123,14 @@ const Register: React.FC = () => {
                 onChange={handleChange}
                 required
                 minLength={6}
-                className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+                className="w-full px-4 py-3 bg-[#2d2d2d] border border-gray-600 rounded-lg text-[#ffffff] placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
                 placeholder="Минимум 6 символов"
               />
             </div>
 
             {/* Поле подтверждения пароля */}
             <div>
-              <label htmlFor="confirmPassword" className="block text-sm font-medium text-gray-300 mb-2">
+              <label htmlFor="confirmPassword" className="block text-sm font-medium text-[#d1d5db] mb-2">
                 Подтверждение пароля
               </label>
               <input
@@ -140,14 +140,14 @@ const Register: React.FC = () => {
                 value={formData.confirmPassword}
                 onChange={handleChange}
                 required
-                className="w-full px-4 py-3 bg-gray-800 border border-gray-700 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+                className="w-full px-4 py-3 bg-[#2d2d2d] border border-gray-600 rounded-lg text-[#ffffff] placeholder-gray-400 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
                 placeholder="Повторите пароль"
               />
             </div>
 
             {/* Сообщение об ошибке */}
             {error && (
-              <div className="bg-red-900/30 border border-red-700 text-red-300 px-4 py-3 rounded-lg">
+              <div className="bg-[#7f1d1d] border border-[#991b1b] text-[#fca5a5] px-4 py-3 rounded-lg">
                 {error}
               </div>
             )}
@@ -156,7 +156,7 @@ const Register: React.FC = () => {
             <button
               type="submit"
               disabled={isLoading}
-              className="w-full bg-green-600 hover:bg-green-700 text-white font-medium py-3 px-4 rounded-lg transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="w-full bg-green-600 hover:bg-green-700 text-[#ffffff] font-medium py-3 px-4 rounded-lg transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isLoading ? "Регистрация..." : "Зарегистрироваться"}
             </button>
@@ -164,7 +164,7 @@ const Register: React.FC = () => {
 
           {/* Ссылка на вход */}
           <div className="mt-6 text-center">
-            <p className="text-gray-400">
+            <p className="text-[#9ca3af]">
               Уже есть аккаунт?{" "}
               <Link
                 to="/login"

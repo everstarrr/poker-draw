@@ -1,5 +1,6 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { db } from '../config/database.js';
+import { gameLog } from '../utils/gameLogger.js';
 
 type Client = WebSocket & { email?: string; gameId?: string };
 
@@ -10,6 +11,7 @@ interface GameRoom {
   deadline?: number | null;
   winnerAnnounced?: boolean;
   hadTwoPlayers?: boolean;
+  timerGeneration?: number;  // Prevents race condition with multiple timer starts
 }
 
 const rooms = new Map<string, GameRoom>();
@@ -21,6 +23,23 @@ function getRoom(gameId: string): GameRoom {
     rooms.set(gameId, room);
   }
   return room;
+}
+
+// Логирование карт после раздачи
+async function logDealtCards(gameId: string) {
+  try {
+    const dealtCards = await db.query(`
+      SELECT p.email, c.number, c.suit 
+      FROM Players_Cards pc 
+      JOIN Players p ON pc.player_id = p.id 
+      JOIN Cards c ON pc.card_id = c.id 
+      WHERE p.game_id = $1 
+      ORDER BY p.email, c.id
+    `, [gameId]);
+    gameLog('CARDS_DEALT', 'Cards dealt to players', { gameId, cards: dealtCards });
+  } catch (e) {
+    // Ignore errors in logging
+  }
 }
 
 async function ensureBlinds(gameId: string) {
@@ -64,33 +83,64 @@ async function broadcastState(gameId: string) {
       const playersCount = await getPlayersCount(gameId);
       const phaseRows = await db.query('SELECT phase FROM games WHERE id = $1', [gameId]);
       const phase = phaseRows?.[0]?.phase || null;
+      
+      // Получаем состояние игроков для лога
+      const playersState = await db.query('SELECT id, email, status, stack FROM players WHERE game_id = $1', [gameId]);
+      gameLog('BROADCAST', `phase=${phase}, winnerAnnounced=${room.winnerAnnounced}, playersCount=${playersCount}`, {
+        players: playersState.map((p: any) => ({ email: p.email, status: p.status, stack: p.stack }))
+      });
+      
+      console.log('[WS] broadcastState check: phase=', phase, 'winnerAnnounced=', room.winnerAnnounced, 'playersCount=', playersCount);
       if (phase === 'showdown' && !room.winnerAnnounced && playersCount >= 2) {
+        // ВАЖНО: Сразу помечаем что победитель объявлен, чтобы избежать race condition
         room.winnerAnnounced = true;
-        const winRes = await db.query('SELECT determine_winner($1) as result', [gameId]);
-        let winnerId: string | null = winRes?.[0]?.result?.winner_id || null;
-        let winnerEmail: string | null = winRes?.[0]?.result?.winner_email || null;
-        if (!winnerEmail && winnerId) {
-          const emailRows = await db.query('SELECT email FROM players WHERE id = $1', [winnerId]);
-          winnerEmail = emailRows?.[0]?.email || null;
+        gameLog('SHOWDOWN', 'Entering showdown winner determination');
+        
+        try {
+          const winRes = await db.query('SELECT determine_winner($1) as result', [gameId]);
+          gameLog('WINNER_RESULT', 'determine_winner returned', winRes?.[0]?.result);
+          console.log('[WS] determine_winner result:', JSON.stringify(winRes?.[0]?.result));
+        
+          // Проверяем success
+          if (!winRes?.[0]?.result?.success) {
+            gameLog('WINNER_FAILED', 'determine_winner failed', winRes?.[0]?.result?.error);
+            console.error('[WS] determine_winner failed:', winRes?.[0]?.result?.error);
+            room.winnerAnnounced = false; // Сбрасываем флаг, т.к. победитель не определен
+            return;
+          }
+        
+          let winnerId: string | null = winRes?.[0]?.result?.winner_id || null;
+          let winnerEmail: string | null = winRes?.[0]?.result?.winner_email || null;
+          if (!winnerEmail && winnerId) {
+            const emailRows = await db.query('SELECT email FROM players WHERE id = $1', [winnerId]);
+            winnerEmail = emailRows?.[0]?.email || null;
+          }
+          // Ensure winnerId refers to players.id so client can match player.id
+          if (!winnerId && winnerEmail) {
+            const pidRows = await db.query('SELECT id FROM players WHERE game_id = $1 AND lower(email) = lower($2) ORDER BY id DESC LIMIT 1', [gameId, winnerEmail]);
+            winnerId = pidRows?.[0]?.id || null;
+          }
+          const handName = winRes?.[0]?.result?.hand_name || null;
+          gameLog('WINNER_ANNOUNCE', `Announcing winner`, { winnerId, winnerEmail, handName });
+          console.log('[WS] Announcing winner:', winnerId, winnerEmail, handName);
+          const winPayload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail, hand_name: handName } });
+          for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(winPayload); }
+          // Keep 7s delay before new round
+          setTimeout(async () => {
+            try {
+              await db.query('SELECT new_round($1) as result', [gameId]);
+              room.winnerAnnounced = false;
+              try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
+              await ensureBlinds(gameId);
+              await broadcastState(gameId);
+              await startTurnTimer(gameId, 30);
+            } catch (e) { console.error('[WS] new round after showdown (broadcastState) failed', e); }
+          }, 7000);
+        } catch (err) {
+          gameLog('SHOWDOWN_ERROR', 'Error during showdown', String(err));
+          console.error('[WS] showdown error:', err);
+          room.winnerAnnounced = false;
         }
-        // Ensure winnerId refers to players.id so client can match player.id
-        if (!winnerId && winnerEmail) {
-          const pidRows = await db.query('SELECT id FROM players WHERE game_id = $1 AND lower(email) = lower($2) ORDER BY id DESC LIMIT 1', [gameId, winnerEmail]);
-          winnerId = pidRows?.[0]?.id || null;
-        }
-        const winPayload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
-        for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(winPayload); }
-        // Keep 7s delay before new round
-        setTimeout(async () => {
-          try {
-            await db.query('SELECT new_round($1) as result', [gameId]);
-            room.winnerAnnounced = false;
-            try { await db.query('SELECT deal_cards($1) as result', [gameId]); } catch {}
-            await ensureBlinds(gameId);
-            await broadcastState(gameId);
-            await startTurnTimer(gameId, 30);
-          } catch (e) { console.error('[WS] new round after showdown (broadcastState) failed', e); }
-        }, 7000);
       }
       // Additionally, if only one active (non-fold) player remains, settle and announce winner
       try {
@@ -127,7 +177,7 @@ async function broadcastState(gameId: string) {
           } catch (e) {
             console.error('[WS] settle last-active player failed', e);
           }
-          const winPayload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
+          const winPayload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail, hand_name: null } });
           for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(winPayload); }
           // Start a new round only if there will be at least two players
           const cntRows = await db.query('SELECT COUNT(*)::int AS cnt FROM players WHERE game_id=$1', [gameId]);
@@ -138,7 +188,7 @@ async function broadcastState(gameId: string) {
                 await db.query('SELECT new_round($1) as result', [gameId]);
                 room.winnerAnnounced = false;
                 room.hadTwoPlayers = false;
-                try { await db.query('SELECT deal_cards($1) as result', [gameId]); } catch {}
+                try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
                 await ensureBlinds(gameId);
                 await broadcastState(gameId);
                 await startTurnTimer(gameId, 30);
@@ -196,6 +246,12 @@ async function maybeStopGame(gameId: string) {
 
 export async function startTurnTimer(gameId: string, seconds = 30) {
   const room = getRoom(gameId);
+  
+  // Increment generation BEFORE any async operations to prevent race condition
+  // Any intervals/timeouts from previous generations will self-terminate
+  room.timerGeneration = (room.timerGeneration || 0) + 1;
+  const currentGeneration = room.timerGeneration;
+  
   clearTimers(room);
   room.winnerAnnounced = false;
   // Do not start timer if players are 0 or 1
@@ -204,6 +260,12 @@ export async function startTurnTimer(gameId: string, seconds = 30) {
     await maybeStopGame(gameId);
     return;
   }
+  
+  // Check if this timer was superseded during async operations
+  if (room.timerGeneration !== currentGeneration) {
+    return; // Another startTurnTimer was called, abort this one
+  }
+  
   // Mark that this round had at least 2 players
   room.hadTwoPlayers = true;
   // Ensure DB-reported max_turn_time is 30s and set turn_start_time to now so clients display correctly
@@ -214,14 +276,29 @@ export async function startTurnTimer(gameId: string, seconds = 30) {
     const t: number = Number(trows?.[0]?.t ?? 30);
     if (Number.isFinite(t) && t > 0) seconds = t;
   } catch {}
+  
+  // Check again after DB operations
+  if (room.timerGeneration !== currentGeneration) {
+    return; // Superseded
+  }
+  
   const end = Date.now() + (seconds * 1000);
   room.deadline = end;
   broadcastTimer(gameId, seconds);
   room.tick = setInterval(() => {
+    // Self-terminate if this interval is from an old generation
+    if (room.timerGeneration !== currentGeneration) {
+      clearInterval(room.tick);
+      return;
+    }
     const remaining = Math.max(0, Math.ceil((end - Date.now()) / 1000));
     broadcastTimer(gameId, remaining);
   }, 1000);
   room.timer = setTimeout(async () => {
+    // Check generation before executing timeout logic
+    if (room.timerGeneration !== currentGeneration) {
+      return; // This timeout is stale
+    }
     clearTimers(room);
     // On timeout, auto-handle: prefer server-side timeout logic (should fold)
     try {
@@ -248,12 +325,13 @@ export async function startTurnTimer(gameId: string, seconds = 30) {
               const pidRows = await db.query('SELECT id FROM players WHERE game_id = $1 AND lower(email) = lower($2) ORDER BY id DESC LIMIT 1', [gameId, winnerEmail]);
               winnerId = pidRows?.[0]?.id || null;
             }
-            const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
+            const handName = winRes?.[0]?.result?.hand_name || null;
+            const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail, hand_name: handName } });
             for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(payload); }
             setTimeout(async () => {
               try {
                 await db.query('SELECT new_round($1) as result', [gameId]);
-                try { await db.query('SELECT deal_cards($1) as result', [gameId]); } catch {}
+                try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
                 await ensureBlinds(gameId);
                 await broadcastState(gameId);
                 await startTurnTimer(gameId, seconds);
@@ -274,13 +352,14 @@ export async function startTurnTimer(gameId: string, seconds = 30) {
             const winnerId = winRes?.[0]?.result?.winner_id || active[0].id;
             const emailRows = await db.query('SELECT email FROM players WHERE id = $1', [winnerId]);
             const winnerEmail = emailRows?.[0]?.email || null;
-            const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
+            const handName = winRes?.[0]?.result?.hand_name || null;
+            const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail, hand_name: handName } });
             const gameRoom = getRoom(gameId);
             for (const ws of gameRoom.clients) { if (ws.readyState === ws.OPEN) ws.send(payload); }
             setTimeout(async () => {
               try {
                 await db.query('SELECT new_round($1) as result', [gameId]);
-                try { await db.query('SELECT deal_cards($1) as result', [gameId]); } catch {}
+                try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
                 await ensureBlinds(gameId);
                 await broadcastState(gameId);
                 await startTurnTimer(gameId, seconds);
@@ -315,7 +394,7 @@ async function maybeAutoStart(gameId: string) {
     // Attempt to start game; ignore if already started
     try { await db.query('SELECT start_game($1) as result', [gameId]); } catch {}
     // Ensure cards are dealt (idempotent)
-    try { await db.query('SELECT deal_cards($1) as result', [gameId]); } catch {}
+    try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
     // Ensure blinds at the beginning of the round (idempotent)
     await ensureBlinds(gameId);
     // Do not immediately new_round; start_game deals cards
@@ -331,12 +410,28 @@ export function bindWebSocketServer(wss: WebSocketServer) {
     try {
       const url = new URL(req.url || '/ws', 'http://localhost');
       const gameId = url.searchParams.get('game_id') || 'unknown';
-      const email = url.searchParams.get('email') || 'anonymous';
+      const rawEmail = url.searchParams.get('email') || '';
+      
+      // Валидация email - проверяем что пользователь существует в БД
+      let validatedEmail: string | null = null;
+      if (rawEmail && rawEmail !== 'anonymous') {
+        try {
+          const userRows = await db.query('SELECT email FROM users WHERE LOWER(email) = LOWER($1)', [rawEmail]);
+          if (userRows.length > 0) {
+            validatedEmail = userRows[0].email;
+          } else {
+            console.warn('[WS] Invalid email attempted:', rawEmail);
+          }
+        } catch (e) {
+          console.error('[WS] Email validation error:', e);
+        }
+      }
+      
       ws.gameId = gameId;
-      ws.email = email;
+      ws.email = validatedEmail || undefined; // Только валидированный email или undefined
       const room = getRoom(gameId);
       room.clients.add(ws);
-      console.log('[WS] connected', { gameId, email, clients: room.clients.size });
+      console.log('[WS] connected', { gameId, email: validatedEmail || 'anonymous', clients: room.clients.size });
 
       ws.on('message', (data) => {
         // Placeholder for future action handling
@@ -347,7 +442,7 @@ export function bindWebSocketServer(wss: WebSocketServer) {
       ws.on('close', () => {
         const r = getRoom(gameId);
         r.clients.delete(ws);
-            startTurnTimer(gameId).catch(() => {});
+        // НЕ перезапускаем таймер при закрытии соединения - это ломает ход игры
         if (r.clients.size === 0) {
           clearTimers(r);
         }
@@ -400,7 +495,7 @@ export async function checkAndHandleWinner(gameId: string, seconds = 30) {
       } catch (e) {
         console.error('[WS] settle last-active player (check) failed', e);
       }
-      const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail } });
+      const payload = JSON.stringify({ type: 'winner', gameId, winner: { id: winnerId, email: winnerEmail, hand_name: null } });
       for (const ws of room.clients) { if (ws.readyState === ws.OPEN) ws.send(payload); }
       // Start a new round only if there will be at least two players
       const cntRows = await db.query('SELECT COUNT(*)::int AS cnt FROM players WHERE game_id=$1', [gameId]);
@@ -411,7 +506,7 @@ export async function checkAndHandleWinner(gameId: string, seconds = 30) {
             await db.query('SELECT new_round($1) as result', [gameId]);
             room.winnerAnnounced = false;
             room.hadTwoPlayers = false;
-            try { await db.query('SELECT deal_cards($1) as result', [gameId]); } catch {}
+            try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
             await ensureBlinds(gameId);
             await broadcastState(gameId);
             await startTurnTimer(gameId);
@@ -422,4 +517,49 @@ export async function checkAndHandleWinner(gameId: string, seconds = 30) {
   } catch (e) {
     console.error('[WS] checkAndHandleWinner error', e);
   }
+}
+
+// Функция для отправки сообщения о победителе всем клиентам
+export async function pushWinnerMessage(gameId: string, winnerId: string | null, winnerEmail: string | null, handName: string | null) {
+  const room = getRoom(gameId);
+  
+  // Помечаем что победитель объявлен
+  room.winnerAnnounced = true;
+  
+  gameLog('PUSH_WINNER', `Sending winner message`, { gameId, winnerId, winnerEmail, handName });
+  
+  const winPayload = JSON.stringify({ 
+    type: 'winner', 
+    gameId, 
+    winner: { id: winnerId, email: winnerEmail, hand_name: handName } 
+  });
+  
+  for (const ws of room.clients) { 
+    if (ws.readyState === ws.OPEN) {
+      ws.send(winPayload);
+    }
+  }
+  
+  // Запускаем таймер на новый раунд
+  setTimeout(async () => {
+    try {
+      const cntRows = await db.query('SELECT COUNT(*)::int AS cnt FROM players WHERE game_id=$1', [gameId]);
+      const cnt: number = Number(cntRows?.[0]?.cnt ?? 0);
+      
+      if (cnt >= 2) {
+        await db.query('SELECT new_round($1) as result', [gameId]);
+        room.winnerAnnounced = false;
+        room.hadTwoPlayers = false;
+        try { await db.query('SELECT deal_cards($1) as result', [gameId]); await logDealtCards(gameId); } catch {}
+        await ensureBlinds(gameId);
+        await broadcastState(gameId);
+        await startTurnTimer(gameId, 30);
+      } else {
+        room.winnerAnnounced = false;
+      }
+    } catch (e) { 
+      console.error('[WS] new round after pushWinnerMessage failed', e); 
+      room.winnerAnnounced = false;
+    }
+  }, 7000);
 }

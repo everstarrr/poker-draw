@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { db } from '../config/database.js';
 import { pushGameState, startTurnTimer, checkAndHandleWinner, ensureBlindsPublic } from '../ws/hub.js';
+import { gameLog } from '../utils/gameLogger.js';
 
 export class GameController {
   // Создание игры
@@ -15,16 +16,15 @@ export class GameController {
         max_stack = 10000,
       } = req.body;
 
-      const creatorEmailRaw = req.headers['x-user-email'];
-      const creatorEmail = typeof creatorEmailRaw === 'string' ? creatorEmailRaw : undefined;
+      const creatorEmail = req.userEmail; // Берем из middleware
 
       if (!creatorEmail) {
-        res.status(401).json({ success: false, error: 'Creator email required' });
+        res.status(401).json({ success: false, error: 'Требуется авторизация' });
         return;
       }
 
       if (!name) {
-        res.status(400).json({ success: false, error: 'Game name is required' });
+        res.status(400).json({ success: false, error: 'Название игры обязательно' });
         return;
       }
 
@@ -156,10 +156,16 @@ export class GameController {
   static async joinGame(req: Request, res: Response): Promise<void> {
     try {
       const { game_id } = req.params;
-      const { email, buy_in } = req.body;
+      const { buy_in } = req.body;
+      const email = req.userEmail; // Берем из middleware
 
-      if (!email || !buy_in) {
-        res.status(400).json({ success: false, error: 'Email and buy_in are required' });
+      if (!email) {
+        res.status(401).json({ success: false, error: 'Требуется авторизация' });
+        return;
+      }
+
+      if (!buy_in) {
+        res.status(400).json({ success: false, error: 'buy_in обязателен' });
         return;
       }
 
@@ -223,11 +229,10 @@ export class GameController {
   static async leaveGameByEmail(req: Request, res: Response): Promise<void> {
     try {
       const { game_id } = req.params;
-      const emailInput = (req.body as any)?.email ?? (req.query as any)?.email ?? (req.headers['x-user-email'] as string | undefined);
-      const email = typeof emailInput === 'string' ? emailInput : undefined;
+      const email = req.userEmail; // Берем из middleware
 
       if (!game_id || !email) {
-        res.status(400).json({ success: false, error: 'game_id and email are required' });
+        res.status(400).json({ success: false, error: 'game_id и email обязательны' });
         return;
       }
 
@@ -308,12 +313,55 @@ export class GameController {
       const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
       const game_id: string | undefined = gidRows?.[0]?.game_id;
 
+      gameLog('ACTION', `CHECK by player ${player_id}`, { game_id });
+
       const result = await db.query(
         'SELECT player_check($1) as result',
         [player_id]
       );
 
       const response = result[0].result;
+      gameLog('ACTION_RESULT', `CHECK result`, response);
+
+      // Проверяем фазу после действия
+      if (game_id) {
+        const phaseRows = await db.query('SELECT phase, pot, current_player_id FROM games WHERE id = $1', [game_id]);
+        const phase = phaseRows[0]?.phase;
+        gameLog('PHASE_AFTER_ACTION', `After CHECK`, phaseRows[0]);
+        
+        // Если перешли в showdown - СРАЗУ определяем победителя до отправки ответа
+        if (phase === 'showdown') {
+          gameLog('SHOWDOWN_TRIGGERED', 'Phase changed to showdown, determining winner immediately');
+          try {
+            // Логируем карты всех игроков перед определением победителя
+            const playersCardsLog = await db.query(`
+              SELECT p.id, p.email, 
+                     array_agg(c.number || ' ' || c.suit ORDER BY c.id) as cards
+              FROM Players p
+              LEFT JOIN Players_Cards pc ON pc.player_id = p.id
+              LEFT JOIN Cards c ON c.id = pc.card_id
+              WHERE p.game_id = $1 AND p.status != 'FOLD'
+              GROUP BY p.id, p.email
+            `, [game_id]);
+            gameLog('SHOWDOWN_CARDS', 'Player cards before winner determination', playersCardsLog);
+
+            const winRes = await db.query('SELECT determine_winner($1) as result', [game_id]);
+            gameLog('SHOWDOWN_WINNER', 'Winner determined', winRes?.[0]?.result);
+            
+            if (winRes?.[0]?.result?.success) {
+              const winnerId = winRes[0].result.winner_id;
+              const winnerEmail = winRes[0].result.winner_email;
+              const handName = winRes[0].result.hand_name;
+              
+              // Отправляем победителя всем клиентам через WebSocket
+              const { pushWinnerMessage } = await import('../ws/hub.js');
+              await pushWinnerMessage(game_id, winnerId, winnerEmail, handName);
+            }
+          } catch (err) {
+            gameLog('SHOWDOWN_ERROR', 'Failed to determine winner', String(err));
+          }
+        }
+      }
 
       if (response.success) {
         res.json(response);
@@ -335,12 +383,43 @@ export class GameController {
       const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
       const game_id: string | undefined = gidRows?.[0]?.game_id;
 
+      gameLog('ACTION', `CALL by player ${player_id}`, { game_id });
+
       const result = await db.query(
         'SELECT player_call($1) as result',
         [player_id]
       );
 
       const response = result[0].result;
+      gameLog('ACTION_RESULT', `CALL result`, response);
+
+      // Проверяем фазу после действия
+      if (game_id) {
+        const phaseRows = await db.query('SELECT phase, pot, current_player_id FROM games WHERE id = $1', [game_id]);
+        const phase = phaseRows[0]?.phase;
+        gameLog('PHASE_AFTER_ACTION', `After CALL`, phaseRows[0]);
+        
+        // Если перешли в showdown - СРАЗУ определяем победителя до отправки ответа
+        if (phase === 'showdown') {
+          gameLog('SHOWDOWN_TRIGGERED', 'Phase changed to showdown after CALL, determining winner immediately');
+          try {
+            const winRes = await db.query('SELECT determine_winner($1) as result', [game_id]);
+            gameLog('SHOWDOWN_WINNER', 'Winner determined', winRes?.[0]?.result);
+            
+            if (winRes?.[0]?.result?.success) {
+              const winnerId = winRes[0].result.winner_id;
+              const winnerEmail = winRes[0].result.winner_email;
+              const handName = winRes[0].result.hand_name;
+              
+              // Отправляем победителя всем клиентам через WebSocket
+              const { pushWinnerMessage } = await import('../ws/hub.js');
+              await pushWinnerMessage(game_id, winnerId, winnerEmail, handName);
+            }
+          } catch (err) {
+            gameLog('SHOWDOWN_ERROR', 'Failed to determine winner after CALL', String(err));
+          }
+        }
+      }
 
       if (response.success) {
         res.json(response);
@@ -425,12 +504,32 @@ export class GameController {
       const gidRows = await db.query('SELECT game_id FROM players WHERE id = $1', [player_id]);
       const game_id: string | undefined = gidRows?.[0]?.game_id;
 
+      // Логируем карты ДО замены
+      const cardsBefore = await db.query(`
+        SELECT c.number, c.suit 
+        FROM Players_Cards pc 
+        JOIN Cards c ON pc.card_id = c.id 
+        WHERE pc.player_id = $1 
+        ORDER BY c.id
+      `, [player_id]);
+      gameLog('REPLACE_CARDS_BEFORE', 'Cards before replacement', { player_id, cards: cardsBefore, discarding: cardIds });
+
       const result = await db.query(
         'SELECT replace_cards($1, $2) as result',
         [player_id, cardIds]
       );
 
       const response = result[0].result;
+
+      // Логируем карты ПОСЛЕ замены
+      const cardsAfter = await db.query(`
+        SELECT c.number, c.suit 
+        FROM Players_Cards pc 
+        JOIN Cards c ON pc.card_id = c.id 
+        WHERE pc.player_id = $1 
+        ORDER BY c.id
+      `, [player_id]);
+      gameLog('REPLACE_CARDS_AFTER', 'Cards after replacement', { player_id, cards: cardsAfter, response });
 
       if (response.success) {
         res.json(response);
@@ -518,22 +617,28 @@ export class GameController {
   static async deleteGame(req: Request, res: Response): Promise<void> {
     try {
       const { game_id } = req.params;
-      const requesterRaw = req.headers['x-user-email'];
-      const requesterEmail = typeof requesterRaw === 'string' ? requesterRaw : undefined;
+      const requesterEmail = req.userEmail; // Берем из middleware
 
       if (!requesterEmail) {
-        res.status(401).json({ success: false, error: 'Email header required' });
+        res.status(401).json({ success: false, error: 'Требуется авторизация' });
         return;
       }
 
       // Fetch game creator and players count
       const gameRows = await db.query('SELECT created_by FROM games WHERE id = $1', [game_id]);
       if (!gameRows || gameRows.length === 0) {
-        res.status(404).json({ success: false, error: 'Game not found' });
+        res.status(404).json({ success: false, error: 'Игра не найдена' });
         return;
       }
 
       const createdBy: string | null = gameRows[0].created_by || null;
+      
+      // Проверяем, что запрашивающий - создатель игры
+      if (!createdBy || createdBy.toLowerCase() !== requesterEmail.toLowerCase()) {
+        res.status(403).json({ success: false, error: 'Только создатель может удалить эту игру' });
+        return;
+      }
+
       const playersCountRows = await db.query('SELECT COUNT(*)::int AS cnt FROM players WHERE game_id = $1', [game_id]);
       const playersCount: number = playersCountRows?.[0]?.cnt ?? 0;
 
@@ -544,21 +649,16 @@ export class GameController {
         if (playersCount === 1 && players?.[0]?.email && createdBy && players[0].email.toLowerCase() === createdBy.toLowerCase()) {
           try { await db.query('SELECT leave_game($1) as result', [players[0].id]); } catch {}
         } else {
-          res.status(400).json({ success: false, error: 'Room must be empty to delete' });
+          res.status(400).json({ success: false, error: 'Комната должна быть пустой для удаления' });
           return;
         }
       }
 
-      if (!createdBy || createdBy.toLowerCase() !== requesterEmail.toLowerCase()) {
-        res.status(403).json({ success: false, error: 'Only creator can delete this game' });
-        return;
-      }
-
       const result = await db.query('DELETE FROM games WHERE id = $1 RETURNING id', [game_id]);
       if (result.length > 0) {
-        res.json({ success: true, message: 'Game deleted successfully', game_id });
+        res.json({ success: true, message: 'Игра успешно удалена', game_id });
       } else {
-        res.status(404).json({ success: false, error: 'Game not found' });
+        res.status(404).json({ success: false, error: 'Игра не найдена' });
       }
     } catch (error) {
       console.error('Delete game error:', error);

@@ -6,6 +6,7 @@ import Login from './pages/auth/login.tsx'
 import Register from './pages/auth/register.tsx'
 import RoomsList from './pages/rooms/rooms-list.tsx'
 import PokerTable from './pages/table/poker-table.tsx'
+import Rules from './pages/rules/rules.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -15,6 +16,7 @@ createRoot(document.getElementById('root')!).render(
         <Route path="/register" element={<Register />} />
         <Route path="/rooms" element={<RoomsList />} />
         <Route path="/table/:roomId" element={<PokerTable />} />
+        <Route path="/rules" element={<Rules />} />
         <Route path="/" element={<Navigate to="/login" replace />} />
       </Routes>
     </BrowserRouter>

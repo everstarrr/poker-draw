@@ -32,7 +32,6 @@ export async function createGame(payload: CreateGamePayload): Promise<CreateGame
 }
 
 export interface JoinGamePayload {
-  email: string;
   buy_in: number;
 }
 
@@ -55,7 +54,8 @@ export async function deleteGame(gameId: string): Promise<void> {
 }
 
 export async function leaveGameByEmail(gameId: string, email: string): Promise<void> {
-  await http.post(`/api/games/${gameId}/leave`, { email });
+  // email теперь автоматически отправляется через заголовок x-user-email
+  await http.post(`/api/games/${gameId}/leave`, {});
 }
 
 // Player actions

@@ -25,7 +25,10 @@
     "update-cards-visibility-showdown": "tsx src/scripts/applyCardsVisibilityShowdownUpdate.ts",
     "fix-replace-cards": "tsx src/scripts/fixReplaceCards.ts",
     "cleanup-cards": "tsx src/scripts/cleanupCards.ts",
-    "clear-games": "tsx src/scripts/clearGames.ts"
+    "clear-games": "tsx src/scripts/clearGames.ts",
+    "fix-leave-game-blinds": "tsx src/scripts/applyLeaveGameBlindsFix.ts",
+    "fix-leave-game-uuid": "tsx src/scripts/applyLeaveGameUuidFix.ts",
+    "fix-security-definer": "tsx src/scripts/applySecurityDefiner.ts"
   },
   "keywords": [],
   "author": "",

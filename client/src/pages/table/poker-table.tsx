@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { connectGameSocket } from "../../api/ws";
 import { getUserInfo } from "../../api/users";
@@ -50,6 +50,11 @@ const PokerTable: React.FC = () => {
   const [winnerUntil, setWinnerUntil] = useState<number | null>(null);
   const [everHadTwoPlayers, setEverHadTwoPlayers] = useState<boolean>(false);
   const [winnerId, setWinnerId] = useState<string | null>(null);
+  const [winnerHandName, setWinnerHandName] = useState<string | null>(null);
+  
+  // Используем ref для синхронного отслеживания активного серверного таймера
+  const serverTimerActiveRef = useRef<boolean>(false);
+  const lastServerTimerTs = useRef<number>(0);
 
   useEffect(() => {
     if (!roomId) return;
@@ -59,22 +64,44 @@ const PokerTable: React.FC = () => {
     ws.onmessage = (evt) => {
       try {
         const msg = JSON.parse(evt.data as any);
+        
+        // === DEBUG LOGGING ===
+        const now = new Date().toISOString().slice(11, 23);
+        if (msg.type === 'timer') {
+          console.log(`[WS ${now}] TIMER: remaining=${msg.remaining}`);
+        } else if (msg.type === 'state') {
+          const state = msg.state?.game || msg.state || {};
+          const players = msg.state?.players || [];
+          const currentPlayer = players.find((p: any) => p.id === state.current_player_id);
+          console.log(`[WS ${now}] STATE: phase=${state.phase}, current_player=${currentPlayer?.email || state.current_player_id}, pot=${state.pot}, players=${players.length}`);
+        } else if (msg.type === 'winner') {
+          console.log(`[WS ${now}] WINNER: email=${msg.winner?.email}, id=${msg.winner?.id}, hand=${msg.winner?.hand_name || msg.hand_name || 'unknown'}`);
+        } else {
+          console.log(`[WS ${now}] OTHER: type=${msg.type}`, msg);
+        }
+        // === END DEBUG ===
+        
         if (msg.type === 'timer') {
           const r = Number(msg.remaining ?? 0);
           setTurnRemaining(Number.isFinite(r) ? Math.max(0, r) : null);
           // If server is authoritative, prefer 30s cap when unknown
           if (!maxTurnTimeSec && Number.isFinite(r) && r > 0) setMaxTurnTimeSec(Math.max(30, r));
           if (!hasServerTimer) setHasServerTimer(true);
+          // Синхронно помечаем что серверный таймер активен
+          serverTimerActiveRef.current = true;
+          lastServerTimerTs.current = Date.now();
           return;
         }
         if (msg.type === 'winner') {
           const email = msg.winner?.email || msg.winner_email || null;
+          const handName = msg.winner?.hand_name || msg.hand_name || null;
           // Always accept winner announcements from server; mark that table had >=2 players
           // This avoids missing the label if 'winner' arrives slightly before phase/state updates.
           if (!everHadTwoPlayers) {
             setEverHadTwoPlayers(true);
           }
           setWinnerEmail(email);
+          setWinnerHandName(handName);
           setWinnerUntil(Date.now() + 7000);
           const idRaw = msg.winner?.id ?? msg.winner_id ?? null;
           setWinnerId(idRaw != null ? String(idRaw) : null);
@@ -102,13 +129,6 @@ const PokerTable: React.FC = () => {
             else if (m.includes('showdown')) { setGamePhase('showdown'); phaseLocal = 'showdown'; }
             else if (m.includes('betting2') || m.includes('round2')) { setGamePhase('betting2'); phaseLocal = 'betting2'; }
             else { setGamePhase('betting1'); phaseLocal = 'betting1'; }
-          }
-          // Do not aggressively clear winner overlay on non-showdown states.
-          // Let the 7s winnerUntil timer control visibility, or clear only if expired.
-          if (phaseLocal !== 'showdown' && winnerUntil && Date.now() >= winnerUntil) {
-            setWinnerEmail(null);
-            setWinnerUntil(null);
-            setWinnerId(null);
           }
           // Actor
           let actorEmail = state?.current_player?.email || state?.current_player_email || null;
@@ -144,21 +164,22 @@ const PokerTable: React.FC = () => {
           // Pot
           const newPot = state?.pot ?? state?.total_pot ?? 0;
           setPot(Number(newPot) || 0);
-          // Turn timing
-          const maxT = Number(state?.max_turn_time ?? 0) || null;
-          const startIso: string | null = state?.turn_start_time || null;
-          setMaxTurnTimeSec(maxT);
-          if (startIso) {
-            const startMs = Date.parse(startIso);
-            setTurnStartTs(Number.isFinite(startMs) ? startMs : null);
-            if (maxT && startMs) {
-              const elapsed = Math.floor((Date.now() - startMs) / 1000);
-              const remain = Math.max(0, maxT - elapsed);
-              setTurnRemaining(remain);
-            }
-          } else {
-            setTurnStartTs(null);
+          
+          // Clear winner overlay when a new round starts
+          // (phase is betting1 and pot is small/reset, meaning blinds just posted)
+          const isNewRound = phaseLocal === 'betting1' && (Number(newPot) <= (bigBlind * 1.5));
+          const winnerExpired = winnerUntil && Date.now() >= winnerUntil;
+          if (phaseLocal !== 'showdown' && (winnerExpired || isNewRound)) {
+            setWinnerEmail(null);
+            setWinnerUntil(null);
+            setWinnerId(null);
+            setWinnerHandName(null);
           }
+          
+          // Turn timing - используем только серверный таймер, не локальный
+          const maxT = Number(state?.max_turn_time ?? 0) || null;
+          setMaxTurnTimeSec(maxT);
+          // turnStartTs больше не нужен - таймер полностью серверный
           // Big blind
           setBigBlind(Number(state?.big_blind ?? bigBlind) || bigBlind);
           // Players
@@ -244,11 +265,32 @@ const PokerTable: React.FC = () => {
           try {
             if (phaseLocal !== 'showdown') {
               const activeNonFolded = withAngles.filter(p => !p.isFolded);
-              // Consider the round started if there is a current actor, a running timer,
-              // any posted bets (incl. blinds), or a non-zero pot.
-              const anyBet = withAngles.some(p => (Number(p.bet || 0) > 0));
-              const roundStarted = !!(currentActorEmail || turnStartTs || anyBet || Number(pot) > 0);
-              if (activeNonFolded.length === 1 && (everHadTwoPlayers || roundStarted)) {
+              
+              // КРИТИЧЕСКИ ВАЖНЫЕ проверки чтобы избежать ложного показа в начале игры:
+              
+              // 1. Должно быть минимум 2 игрока за столом (чтобы данные полностью загрузились)
+              const hasEnoughPlayers = withAngles.length >= 2;
+              
+              // 2. Должен быть активный игрок (ход начался)
+              const hasActivePlayer = !!actorEmail;
+              
+              // 3. Хотя бы один игрок сфолдился (реальное игровое действие произошло)
+              const someoneFolded = withAngles.some(p => p.isFolded);
+              
+              // 4. Или мы НЕ в первом раунде (значит игра продвинулась дальше)
+              const notFirstBetting = phaseLocal !== 'betting1';
+              
+              // 5. Или в банке значительно больше чем блайнды (были рейзы)
+              const potBiggerThanBlinds = pot > (bigBlind * 1.5);
+              
+              // Показываем победителя ТОЛЬКО если:
+              // - Есть минимум 2 игрока (данные загружены)
+              // - Есть текущий активный игрок (ход начался)
+              // - И хотя бы одно из: кто-то сфолдился ИЛИ не первый раунд ИЛИ большой банк
+              const gameActuallyStarted = hasEnoughPlayers && hasActivePlayer && 
+                                         (someoneFolded || notFirstBetting || potBiggerThanBlinds);
+              
+              if (activeNonFolded.length === 1 && everHadTwoPlayers && gameActuallyStarted) {
                 const w = activeNonFolded[0];
                 if (!winnerUntil || Date.now() >= winnerUntil) {
                   setWinnerEmail(w.email || null);
@@ -276,26 +318,28 @@ const PokerTable: React.FC = () => {
     };
   }, [roomId]);
 
-  // Local stable countdown based on server turn_start_time and max_turn_time
-  // Only compute locally when we don't have a server timer AND we have the necessary data
+  // Отдельный useEffect для отслеживания активности серверного таймера
+  // Сбрасывает флаг если сервер долго не присылает обновления
   useEffect(() => {
-    // Prefer server-sent timer; only fallback to local calculation
-    if (hasServerTimer || !turnStartTs || !maxTurnTimeSec) {
+    if (!hasServerTimer) {
       return;
     }
     
-    // Synchronize local timer with current server-provided remaining time
-    const tick = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - turnStartTs) / 1000);
-      const remain = Math.max(0, maxTurnTimeSec - elapsed);
-      // Only update if the value actually changed to avoid unnecessary re-renders
-      setTurnRemaining((prev) => {
-        const newVal = remain;
-        return prev !== newVal ? newVal : prev;
-      });
-    }, 100); // Check every 100ms for smoother updates instead of 1s jumps
-    return () => clearInterval(tick);
-  }, [turnStartTs, maxTurnTimeSec, hasServerTimer]);
+    // Проверяем каждые 1.5 секунды, не устарел ли серверный таймер
+    const checkTimeout = setInterval(() => {
+      if (Date.now() - lastServerTimerTs.current > 2000) {
+        // Серверный таймер молчит больше 2 секунд - сбрасываем
+        serverTimerActiveRef.current = false;
+        setHasServerTimer(false);
+        setTurnRemaining(null);
+      }
+    }, 1500);
+    
+    return () => clearInterval(checkTimeout);
+  }, [hasServerTimer]);
+
+  // Локальный таймер ПОЛНОСТЬЮ ОТКЛЮЧЕН - используем только серверный
+  // Сервер присылает timer сообщения каждую секунду, этого достаточно
 
   const Card: React.FC<{
     suit: string;
@@ -370,10 +414,10 @@ const PokerTable: React.FC = () => {
 
     const containerCls =
       player.isYou
-        ? "bg-gray-300 text-black border-gray-400"
+        ? "bg-[#d1d5db] text-[#000000] border-[#9ca3af]"
         : player.isActive
-        ? "bg-linear-to-br from-gray-800 to-black text-white border-white"
-        : "bg-linear-to-br from-gray-600 to-gray-800 text-white border-gray-500";
+        ? "bg-linear-to-br from-[#1f2937] to-[#000000] text-[#ffffff] border-[#ffffff]"
+        : "bg-linear-to-br from-[#4b5563] to-[#1f2937] text-[#ffffff] border-[#6b7280]";
 
     return (
       <div
@@ -385,7 +429,7 @@ const PokerTable: React.FC = () => {
             <div className="font-bold text-xs flex items-center justify-center gap-2">
               <span>{player.name}</span>
               {player.isFolded && (
-                <span className="px-2 py-0.5 rounded bg-red-700 text-white text-[10px] font-bold">FOLD</span>
+                <span className="px-2 py-0.5 rounded bg-[#991b1b] text-[#ffffff] text-[10px] font-bold">FOLD</span>
               )}
             </div>
             <div className="text-xs opacity-80">Фишки: {player.chips}</div>
@@ -399,7 +443,10 @@ const PokerTable: React.FC = () => {
               (winnerId && String(player.id) === String(winnerId)) ||
               (winnerEmail && player.email && player.email.toLowerCase() === winnerEmail.toLowerCase())
             ) && (
-              <div className="text-green-400 font-bold text-xs mt-1">Победитель ✨</div>
+              <div className="text-green-400 font-bold text-xs mt-1">
+                Победитель ✨
+                {winnerHandName && <div className="text-yellow-300 text-[10px]">{winnerHandName}</div>}
+              </div>
             )}
           </div>
 
@@ -467,9 +514,9 @@ const PokerTable: React.FC = () => {
   };
 
   return (
-    <div className="w-screen h-screen bg-linear-to-br from-gray-900 via-black to-gray-800 flex items-center justify-center p-4">
+    <div className="w-screen h-screen bg-linear-to-br from-[#111827] via-[#000000] to-[#1f2937] flex items-center justify-center p-4">
       {/* Кнопка выхода */}
-      <div className="absolute top-4 left-4 bg-black bg-opacity-80 p-3 rounded-xl border-2 border-gray-600 flex gap-2">
+      <div className="absolute top-4 left-4 bg-black bg-opacity-80 p-3 rounded-xl border-2 border-[#4b5563] flex gap-2">
         <button
           onClick={async () => {
             try {
@@ -497,24 +544,24 @@ const PokerTable: React.FC = () => {
               navigate('/rooms');
             }
           }}
-          className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg font-bold"
+          className="px-4 py-2 bg-[#374151] hover:bg-[#4b5563] text-[#ffffff] rounded-lg font-bold"
         >
           Выйти из комнаты
         </button>
       </div>
 
       {/* Индикатор фазы игры */}
-      <div className="absolute top-4 right-4 bg-black bg-opacity-80 px-6 py-3 rounded-xl border-2 border-gray-600">
-        <div className="text-white font-bold text-lg">{getPhaseText()}</div>
+      <div className="absolute top-4 right-4 bg-black bg-opacity-80 px-6 py-3 rounded-xl border-2 border-[#4b5563]">
+        <div className="text-[#ffffff] font-bold text-lg">{getPhaseText()}</div>
       </div>
 
       {/* Игровой стол */}
       <div
-        className="relative w-full max-w-5xl aspect-video bg-linear-to-br from-gray-700 to-gray-800 rounded-[50%] shadow-2xl border-8 border-black"
+        className="relative w-full max-w-5xl aspect-video bg-linear-to-br from-[#374151] to-[#1f2937] rounded-[50%] shadow-2xl border-8 border-black"
         style={{ marginTop: "-8vh", maxHeight: "55vh" }}
       >
         {/* Внутренняя граница стола */}
-        <div className="absolute inset-8 border-4 border-gray-900 rounded-[50%]"></div>
+        <div className="absolute inset-8 border-4 border-[#111827] rounded-[50%]"></div>
 
         {/* Игроки */}
         {players.map((player) => (
@@ -523,9 +570,9 @@ const PokerTable: React.FC = () => {
 
         {/* Центр стола - банк */}
         <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
-          <div className="bg-black bg-opacity-70 text-white px-8 py-4 rounded-full border-4 border-yellow-500 shadow-xl">
+          <div className="bg-black bg-opacity-70 text-[#ffffff] px-8 py-4 rounded-full border-4 border-yellow-500 shadow-xl">
             <div className="text-center">
-              <div className="text-sm text-gray-300">БАНК</div>
+              <div className="text-sm text-[#d1d5db]">БАНК</div>
               <div className="text-3xl font-bold text-yellow-400">{pot}</div>
             </div>
           </div>
@@ -548,39 +595,65 @@ const PokerTable: React.FC = () => {
         const maxBet = Math.max(0, ...players.map(p => p.bet || 0));
         const myBet = me?.bet || 0;
         const myChips = me?.chips || 0;
-        const cannotAct = !isMyTurn || myChips <= 0;
-        const cannotCheck = cannotAct || (maxBet > myBet);
-        const cannotCall = cannotAct || (maxBet <= myBet);
-        const cls = (enabled: boolean, on: string, off: string) => (enabled ? on : off);
+        const cannotAct = !isMyTurn || myChips <= 0 || !myPlayerId;
+        const canCheck = isMyTurn && myPlayerId && myChips > 0 && (maxBet <= myBet);
+        const canCall = isMyTurn && myPlayerId && myChips > 0 && (maxBet > myBet);
+        const canRaise = isMyTurn && myPlayerId && myChips > 0;
+        const canFold = isMyTurn && myPlayerId;
+        
         return (
-          <div className="absolute right-6 bottom-24 flex flex-col gap-3 bg-black bg-opacity-80 p-4 rounded-xl border-2 border-gray-600">
+          <div className="absolute right-6 bottom-24 flex flex-col gap-3 bg-black bg-opacity-80 p-4 rounded-xl border-2 border-[#4b5563]">
             {showBettingActions && (
               <>
                 <button
-                  disabled={cannotAct || !myPlayerId}
-                  onClick={async () => { if (!myPlayerId || cannotAct) return; try { await foldPlayer(myPlayerId); } catch {} }}
-                  className={`px-6 py-2 rounded-lg font-bold ${cls(!cannotAct && !!myPlayerId, 'bg-red-600 text-white', 'bg-red-900 text-red-300 cursor-not-allowed')}`}
+                  disabled={!canFold}
+                  onClick={async () => { 
+                    if (!canFold) return; 
+                    try { 
+                      await foldPlayer(myPlayerId!); 
+                    } catch (e) {
+                      console.error('Fold failed:', e);
+                    } 
+                  }}
+                  className={`px-6 py-2 rounded-lg font-bold ${canFold ? 'bg-red-600 text-[#ffffff] hover:bg-red-700 cursor-pointer' : 'bg-[#7f1d1d] text-[#fca5a5] cursor-not-allowed opacity-50'}`}
                 >
                   Фолд
                 </button>
                 <button
-                  disabled={cannotCheck || !myPlayerId}
-                  onClick={async () => { if (!myPlayerId || cannotCheck) return; try { await checkPlayer(myPlayerId); } catch {} }}
-                  className={`px-6 py-2 rounded-lg font-bold ${cls(!cannotCheck && !!myPlayerId, 'bg-gray-700 text-white', 'bg-gray-800 text-gray-400 cursor-not-allowed')}`}
+                  disabled={!canCheck}
+                  onClick={async () => { 
+                    if (!canCheck) return; 
+                    try { 
+                      await checkPlayer(myPlayerId!); 
+                    } catch (e) {
+                      console.error('Check failed:', e);
+                    } 
+                  }}
+                  className={`px-6 py-2 rounded-lg font-bold ${canCheck ? 'bg-[#374151] text-[#ffffff] hover:bg-[#4b5563] cursor-pointer' : 'bg-[#1f2937] text-[#9ca3af] cursor-not-allowed opacity-50'}`}
                 >
                   Чек
                 </button>
                 <button
-                  disabled={cannotCall || !myPlayerId}
-                  onClick={async () => { if (!myPlayerId || cannotCall) return; try { await callPlayer(myPlayerId); } catch {} }}
-                  className={`px-6 py-2 rounded-lg font-bold ${cls(!cannotCall && !!myPlayerId, 'bg-gray-700 text-white', 'bg-gray-800 text-gray-400 cursor-not-allowed')}`}
+                  disabled={!canCall}
+                  onClick={async () => { 
+                    if (!canCall) return; 
+                    try { 
+                      await callPlayer(myPlayerId!); 
+                    } catch (e) {
+                      console.error('Call failed:', e);
+                    } 
+                  }}
+                  className={`px-6 py-2 rounded-lg font-bold ${canCall ? 'bg-[#374151] text-[#ffffff] hover:bg-[#4b5563] cursor-pointer' : 'bg-[#1f2937] text-[#9ca3af] cursor-not-allowed opacity-50'}`}
                 >
                   Колл
                 </button>
                 <button
-                  disabled={cannotAct || !myPlayerId}
-                  onClick={() => { if (!cannotAct && myPlayerId) setShowRaise((prev) => !prev); }}
-                  className={`px-6 py-2 rounded-lg font-bold ${cls(!cannotAct && !!myPlayerId, 'bg-green-600 text-white', 'bg-green-900 text-green-300 cursor-not-allowed')}`}
+                  disabled={!canRaise}
+                  onClick={() => { 
+                    if (!canRaise) return; 
+                    setShowRaise((prev) => !prev); 
+                  }}
+                  className={`px-6 py-2 rounded-lg font-bold ${canRaise ? 'bg-green-600 text-[#ffffff] hover:bg-green-700 cursor-pointer' : 'bg-[#14532d] text-[#86efac] cursor-not-allowed opacity-50'}`}
                 >
                   Рейз
                 </button>
@@ -588,8 +661,9 @@ const PokerTable: React.FC = () => {
             )}
             {showExchangeAction && (
               <button
+                disabled={!myPlayerId}
                 onClick={handleExchange}
-                className="px-6 py-2 bg-yellow-500 text-black rounded-lg font-bold"
+                className={`px-6 py-2 rounded-lg font-bold ${myPlayerId ? 'bg-yellow-500 text-[#000000] hover:bg-yellow-600 cursor-pointer' : 'bg-yellow-700 text-[#000000] cursor-not-allowed opacity-50'}`}
               >
                 Обменять ({selectedCards.length})
               </button>
@@ -610,9 +684,11 @@ const PokerTable: React.FC = () => {
             const safeMin = Math.min(minRaise, myChips);
             const safeMax = myChips;
             if (raiseAmount < safeMin) setRaiseAmount(safeMin);
+            const canConfirmRaise = myPlayerId && raiseAmount >= minRaise && raiseAmount <= myChips;
+            
             return (
               <>
-                <div className="text-white font-bold mb-2">Рейз: {raiseAmount}</div>
+                <div className="text-[#ffffff] font-bold mb-2">Рейз: {raiseAmount}</div>
                 <input
                   type="range"
                   min={safeMin}
@@ -623,16 +699,18 @@ const PokerTable: React.FC = () => {
                   className="w-full"
                 />
                 <button
-                  disabled={!myPlayerId || raiseAmount < minRaise}
+                  disabled={!canConfirmRaise}
                   onClick={async () => {
-                    if (!myPlayerId || raiseAmount < minRaise) return;
+                    if (!canConfirmRaise) return;
                     try {
-                      await raisePlayer(myPlayerId, raiseAmount);
+                      await raisePlayer(myPlayerId!, raiseAmount);
                       setLastActions((la) => ({ ...la, [String(me?.email || '').toLowerCase()]: `Рейз ${raiseAmount}` }));
-                    } catch {}
-                    setShowRaise(false);
+                      setShowRaise(false);
+                    } catch (e) {
+                      console.error('Raise failed:', e);
+                    }
                   }}
-                  className={`mt-3 w-full px-4 py-2 rounded-lg font-bold ${(!myPlayerId || raiseAmount < minRaise) ? 'bg-green-900 text-green-300 cursor-not-allowed' : 'bg-green-600 text-white'}`}
+                  className={`mt-3 w-full px-4 py-2 rounded-lg font-bold ${canConfirmRaise ? 'bg-green-600 text-[#ffffff] hover:bg-green-700 cursor-pointer' : 'bg-[#14532d] text-[#86efac] cursor-not-allowed opacity-50'}`}
                 >
                   Подтвердить
                 </button>
