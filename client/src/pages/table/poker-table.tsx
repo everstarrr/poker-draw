@@ -43,6 +43,7 @@ const PokerTable: React.FC = () => {
   const [turnStartTs, setTurnStartTs] = useState<number | null>(null);
   const [maxTurnTimeSec, setMaxTurnTimeSec] = useState<number | null>(null);
   const [hasServerTimer, setHasServerTimer] = useState<boolean>(false);
+  const [waitingCount, setWaitingCount] = useState<number>(0);
   const [players, setPlayers] = useState<PlayerType[]>([]);
   const [myCards, setMyCards] = useState<CardType[]>([]);
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
@@ -117,6 +118,9 @@ const PokerTable: React.FC = () => {
         }
         // Ignore timer broadcast; we'll compute locally for stability
         if (msg.type === 'state') {
+          const wcRaw = msg.waitingCount ?? msg.waiting_count ?? 0;
+          const wc = Number(wcRaw);
+          setWaitingCount(Number.isFinite(wc) ? Math.max(0, wc) : 0);
           const full = msg.state || {};
           const state = full.game || full; // game-level fields
           const list = full.players || [];
@@ -553,8 +557,17 @@ const PokerTable: React.FC = () => {
       </div>
 
       {/* Индикатор фазы игры */}
-      <div className="absolute top-4 right-4 bg-black bg-opacity-80 px-6 py-3 rounded-xl border-2 border-[#4b5563]">
+      <div className="absolute top-4 right-4 bg-black bg-opacity-80 px-6 py-3 rounded-xl border-2 border-[#4b5563] flex items-center gap-3">
         <div className="text-[#ffffff] font-bold text-lg">{getPhaseText()}</div>
+        {waitingCount > 0 && (
+          <div className="flex items-center gap-2 px-2 py-1 rounded-lg border border-yellow-500 bg-black/40">
+            <svg className="w-4 h-4 text-yellow-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
+            <span className="text-yellow-300 text-sm font-bold">{waitingCount}</span>
+          </div>
+        )}
       </div>
       
       {/* Ожидание следующего раунда */}
