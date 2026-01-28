@@ -61,6 +61,23 @@ async function addWaitingPlayers(gameId: string): Promise<number> {
     try {
       const res = await db.query('SELECT join_game($1, $2, $3) as result', [gameId, entry.email, buyIn]);
       if (res?.[0]?.result?.success) {
+        // Ensure newly added player is ready for the round
+        try {
+          const pidRows = await db.query(
+            'SELECT id FROM players WHERE game_id = $1 AND lower(email) = lower($2) ORDER BY id DESC LIMIT 1',
+            [gameId, entry.email]
+          );
+          const pid = pidRows?.[0]?.id;
+          if (pid) {
+            // Normalize status for a new round
+            await db.query('UPDATE players SET status = $2 WHERE id = $1', [pid, 'CHECK']);
+            // Ensure a bet row exists for the player
+            await db.query(
+              'INSERT INTO bets (player_id, amount) SELECT $1, 0 WHERE NOT EXISTS (SELECT 1 FROM bets WHERE player_id = $1)',
+              [pid]
+            );
+          }
+        } catch {}
         added += 1;
         continue;
       }
