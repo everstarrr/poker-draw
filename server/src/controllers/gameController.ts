@@ -1,6 +1,6 @@
 import { Request, Response } from 'express';
 import { db } from '../config/database.js';
-import { pushGameState, startTurnTimer, checkAndHandleWinner, ensureBlindsPublic } from '../ws/hub.js';
+import { pushGameState, startTurnTimer, checkAndHandleWinner, ensureBlindsPublic, queueWaitingPlayer } from '../ws/hub.js';
 import { gameLog } from '../utils/gameLogger.js';
 
 export class GameController {
@@ -168,6 +168,39 @@ export class GameController {
         res.status(400).json({ success: false, error: 'buy_in обязателен' });
         return;
       }
+      
+      // If already in game, just return success (avoid re-queueing)
+      try {
+        const existingRows = await db.query(
+          'SELECT id FROM players WHERE game_id = $1 AND lower(email) = lower($2) ORDER BY id DESC LIMIT 1',
+          [game_id, email]
+        );
+        if (existingRows && existingRows.length > 0) {
+          res.json({ success: true, already_in_game: true });
+          try { await pushGameState(game_id); } catch {}
+          return;
+        }
+      } catch {}
+
+      // If a round is already in progress with 2+ players, queue this user for next round
+      let inProgress = false;
+      try {
+        const cntRows = await db.query('SELECT COUNT(*)::int AS cnt FROM players WHERE game_id = $1', [game_id]);
+        const cnt: number = Number(cntRows?.[0]?.cnt ?? 0);
+        const stateRows = await db.query('SELECT phase, current_player_id, turn_start_time FROM games WHERE id = $1', [game_id]);
+        const phase = String(stateRows?.[0]?.phase ?? '').toLowerCase();
+        const currentPlayerId = stateRows?.[0]?.current_player_id ?? null;
+        const turnStart = stateRows?.[0]?.turn_start_time ?? null;
+        const showdown = phase === 'showdown';
+        inProgress = cnt >= 2 && (currentPlayerId || turnStart || showdown);
+      } catch {}
+
+      if (inProgress) {
+        queueWaitingPlayer(game_id, email, buy_in);
+        res.json({ success: true, waiting: true, message: 'Вы добавлены в ожидание следующего раунда' });
+        try { await pushGameState(game_id); } catch {}
+        return;
+      }
 
       const result = await db.query(
         'SELECT join_game($1, $2, $3) as result',
@@ -180,7 +213,12 @@ export class GameController {
         res.json(response);
         try {
           await pushGameState(game_id);
-          await startTurnTimer(game_id);
+          // Do not reset timer if a turn is already running
+          const stateRows = await db.query('SELECT current_player_id, turn_start_time FROM games WHERE id = $1', [game_id]);
+          const hasActiveTurn = !!stateRows?.[0]?.current_player_id && !!stateRows?.[0]?.turn_start_time;
+          if (!hasActiveTurn) {
+            await startTurnTimer(game_id);
+          }
         } catch {}
       } else {
         res.status(400).json(response);

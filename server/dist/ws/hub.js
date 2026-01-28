@@ -4,10 +4,59 @@ const rooms = new Map();
 function getRoom(gameId) {
     let room = rooms.get(gameId);
     if (!room) {
-        room = { clients: new Set(), deadline: null, hadTwoPlayers: false };
+        room = { clients: new Set(), deadline: null, hadTwoPlayers: false, waiting: new Map() };
         rooms.set(gameId, room);
     }
     return room;
+}
+function normalizeEmail(email) {
+    return String(email || '').trim().toLowerCase();
+}
+function getWaiting(room) {
+    if (!room.waiting)
+        room.waiting = new Map();
+    return room.waiting;
+}
+export function queueWaitingPlayer(gameId, email, buyIn) {
+    const room = getRoom(gameId);
+    const waiting = getWaiting(room);
+    const key = normalizeEmail(email);
+    waiting.set(key, { email, buyIn: Number(buyIn) || 0 });
+    gameLog('WAITING_QUEUE', 'Queued player for next round', { gameId, email: key, buyIn: Number(buyIn) || 0 });
+}
+export function isWaitingPlayer(gameId, email) {
+    const room = rooms.get(gameId);
+    if (!room?.waiting)
+        return false;
+    return room.waiting.has(normalizeEmail(email));
+}
+async function addWaitingPlayers(gameId) {
+    const room = getRoom(gameId);
+    const waiting = getWaiting(room);
+    if (waiting.size === 0)
+        return 0;
+    const entries = Array.from(waiting.entries());
+    const remaining = new Map();
+    let added = 0;
+    for (const [key, entry] of entries) {
+        const buyIn = Math.max(0, Number(entry.buyIn) || 0);
+        try {
+            const res = await db.query('SELECT join_game($1, $2, $3) as result', [gameId, entry.email, buyIn]);
+            if (res?.[0]?.result?.success) {
+                added += 1;
+                continue;
+            }
+        }
+        catch (e) {
+            // Keep in waiting list if join failed
+        }
+        remaining.set(key, entry);
+    }
+    room.waiting = remaining;
+    if (added > 0) {
+        gameLog('WAITING_JOIN', 'Added waiting players to game', { gameId, added, remaining: remaining.size });
+    }
+    return added;
 }
 // Логирование карт после раздачи
 async function logDealtCards(gameId) {
@@ -49,12 +98,20 @@ export async function ensureBlindsPublic(gameId) {
 async function broadcastState(gameId) {
     try {
         const room = getRoom(gameId);
+        let playersState = [];
+        let playerEmailSet = new Set();
+        try {
+            playersState = await db.query('SELECT id, email, status, stack FROM players WHERE game_id = $1', [gameId]);
+            playerEmailSet = new Set(playersState.map((p) => normalizeEmail(p.email || '')));
+        }
+        catch { }
         for (const ws of room.clients) {
             if (ws.readyState !== ws.OPEN)
                 continue;
             const email = ws.email || null;
             let res;
-            if (email) {
+            const emailKey = email ? normalizeEmail(email) : '';
+            if (email && playerEmailSet.has(emailKey)) {
                 res = await db.query('SELECT get_game_state_for_email($1, $2) as result', [gameId, email]);
             }
             else {
@@ -70,9 +127,11 @@ async function broadcastState(gameId) {
             const phaseRows = await db.query('SELECT phase FROM games WHERE id = $1', [gameId]);
             const phase = phaseRows?.[0]?.phase || null;
             // Получаем состояние игроков для лога
-            const playersState = await db.query('SELECT id, email, status, stack FROM players WHERE game_id = $1', [gameId]);
+            const playersForLog = playersState.length
+                ? playersState
+                : await db.query('SELECT id, email, status, stack FROM players WHERE game_id = $1', [gameId]);
             gameLog('BROADCAST', `phase=${phase}, winnerAnnounced=${room.winnerAnnounced}, playersCount=${playersCount}`, {
-                players: playersState.map((p) => ({ email: p.email, status: p.status, stack: p.stack }))
+                players: playersForLog.map((p) => ({ email: p.email, status: p.status, stack: p.stack }))
             });
             console.log('[WS] broadcastState check: phase=', phase, 'winnerAnnounced=', room.winnerAnnounced, 'playersCount=', playersCount);
             if (phase === 'showdown' && !room.winnerAnnounced && playersCount >= 2) {
@@ -114,6 +173,7 @@ async function broadcastState(gameId) {
                         try {
                             await db.query('SELECT new_round($1) as result', [gameId]);
                             room.winnerAnnounced = false;
+                            await addWaitingPlayers(gameId);
                             try {
                                 await db.query('SELECT deal_cards($1) as result', [gameId]);
                                 await logDealtCards(gameId);
@@ -181,6 +241,7 @@ async function broadcastState(gameId) {
                                 await db.query('SELECT new_round($1) as result', [gameId]);
                                 room.winnerAnnounced = false;
                                 room.hadTwoPlayers = false;
+                                await addWaitingPlayers(gameId);
                                 try {
                                     await db.query('SELECT deal_cards($1) as result', [gameId]);
                                     await logDealtCards(gameId);
@@ -344,6 +405,7 @@ export async function startTurnTimer(gameId, seconds = 30) {
                         setTimeout(async () => {
                             try {
                                 await db.query('SELECT new_round($1) as result', [gameId]);
+                                await addWaitingPlayers(gameId);
                                 try {
                                     await db.query('SELECT deal_cards($1) as result', [gameId]);
                                     await logDealtCards(gameId);
@@ -387,6 +449,7 @@ export async function startTurnTimer(gameId, seconds = 30) {
                         setTimeout(async () => {
                             try {
                                 await db.query('SELECT new_round($1) as result', [gameId]);
+                                await addWaitingPlayers(gameId);
                                 try {
                                     await db.query('SELECT deal_cards($1) as result', [gameId]);
                                     await logDealtCards(gameId);
@@ -424,6 +487,29 @@ async function maybeAutoStart(gameId) {
     if (playersCount < 2) {
         // Not enough players to run the timer; keep room idle
         await maybeStopGame(gameId);
+        return;
+    }
+    // If a round is already in progress, do not restart or re-deal on new connections.
+    let currentPlayerId = null;
+    let turnStart = null;
+    let phase = '';
+    try {
+        const rows = await db.query('SELECT phase, current_player_id, turn_start_time FROM games WHERE id = $1', [gameId]);
+        phase = String(rows?.[0]?.phase ?? '');
+        currentPlayerId = rows?.[0]?.current_player_id ?? null;
+        turnStart = rows?.[0]?.turn_start_time ?? null;
+    }
+    catch { }
+    const phaseLower = phase.toLowerCase();
+    const inProgress = !!currentPlayerId ||
+        !!turnStart ||
+        phaseLower === 'showdown';
+    if (inProgress) {
+        await broadcastState(gameId);
+        const room = getRoom(gameId);
+        if (!room.timer && !room.tick && !room.deadline) {
+            await startTurnTimer(gameId, 30);
+        }
         return;
     }
     try {
@@ -486,6 +572,12 @@ export function bindWebSocketServer(wss) {
             ws.on('close', () => {
                 const r = getRoom(gameId);
                 r.clients.delete(ws);
+                if (ws.email) {
+                    const key = normalizeEmail(ws.email);
+                    if (r.waiting?.has(key)) {
+                        r.waiting.delete(key);
+                    }
+                }
                 // НЕ перезапускаем таймер при закрытии соединения - это ломает ход игры
                 if (r.clients.size === 0) {
                     clearTimers(r);
@@ -553,6 +645,7 @@ export async function checkAndHandleWinner(gameId, seconds = 30) {
                         await db.query('SELECT new_round($1) as result', [gameId]);
                         room.winnerAnnounced = false;
                         room.hadTwoPlayers = false;
+                        await addWaitingPlayers(gameId);
                         try {
                             await db.query('SELECT deal_cards($1) as result', [gameId]);
                             await logDealtCards(gameId);
@@ -598,6 +691,7 @@ export async function pushWinnerMessage(gameId, winnerId, winnerEmail, handName)
                 await db.query('SELECT new_round($1) as result', [gameId]);
                 room.winnerAnnounced = false;
                 room.hadTwoPlayers = false;
+                await addWaitingPlayers(gameId);
                 try {
                     await db.query('SELECT deal_cards($1) as result', [gameId]);
                     await logDealtCards(gameId);

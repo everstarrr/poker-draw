@@ -512,6 +512,8 @@ const PokerTable: React.FC = () => {
         return "";
     }
   };
+  
+  const isWaitingForNextRound = !myPlayerId && players.length >= 2 && !!currentActorEmail;
 
   return (
     <div className="w-screen h-screen bg-linear-to-br from-[#111827] via-[#000000] to-[#1f2937] flex items-center justify-center p-4">
@@ -554,6 +556,13 @@ const PokerTable: React.FC = () => {
       <div className="absolute top-4 right-4 bg-black bg-opacity-80 px-6 py-3 rounded-xl border-2 border-[#4b5563]">
         <div className="text-[#ffffff] font-bold text-lg">{getPhaseText()}</div>
       </div>
+      
+      {/* Ожидание следующего раунда */}
+      {isWaitingForNextRound && (
+        <div className="absolute top-20 left-1/2 -translate-x-1/2 bg-black bg-opacity-80 px-6 py-3 rounded-xl border-2 border-yellow-500">
+          <div className="text-yellow-300 font-bold text-sm">Вы в ожидании следующего раунда — наблюдайте за игрой</div>
+        </div>
+      )}
 
       {/* Игровой стол */}
       <div
